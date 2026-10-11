@@ -9,14 +9,18 @@
 // no Claude turn) and hides them from the menu so /roll is the one listed.
 //
 // A command typed mid-turn may still wait for the turn on some surfaces, so
-// the same controls also sit in the row under the prompt (or, in the desktop
-// app, which draws that footer itself, the band above it), after the status:
-// on/off for this session, restart, and Settings, which opens the /config
-// options in a pane (or, where no pane can be placed, a box above the
-// prompt). They act the moment they are pressed.
+// the same controls also sit beside the status: in the row under the prompt,
+// in Toggle/Restart/Settings order, on surfaces that draw one (the terminal),
+// and in one compact "RC" line in the band above the prompt where no row
+// under the prompt is drawn (the desktop app draws that footer itself). The
+// band is the only place on the desktop where buttons can sit — the status
+// line takes text only, a pane has to be opened, toasts fade — so it stays to
+// that one line. Settings opens the /config options in a pane (or, where no
+// pane can be placed, a box above the prompt). The buttons act the moment
+// they are pressed.
 //
-// The row (or, on a surface without one, the status line) and the settings
-// read the proxy's /health for this session.
+// The status line under the prompt always carries the status, and the row,
+// the band and the settings read the proxy's /health for this session.
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
@@ -30,6 +34,12 @@ const STATUS_EVERY_MS = 30_000
 const USAGE =
   'Usage: /roll [status|on|off|restart] [--global], or /roll set <trigger|target|retention> <value>'
 const PANE = 'settings'
+
+// The retention choices from userConfig, when the /config row carries no
+// options of its own (then the dropdown would offer only the current value).
+const RETENTION_OPTIONS = [
+  '1 hour', '6 hours', '1 day', '3 days', '7 days', '14 days', '30 days', 'Never',
+]
 
 
 // The /config options the settings and /roll set change, by the names /roll set takes.
@@ -101,6 +111,15 @@ function isOn(h: Health) {
   return h.session ? h.session.enabled : h.enabled !== false
 }
 
+// The toggle for this session's state: starting the proxy where none answers.
+function toggleAction(now: Health | null) {
+  if (!now) return { label: 'Start proxy', args: 'restart' }
+  if (isOn(now)) return { label: 'Turn off', args: 'off' }
+  return now.session?.scope === 'machine-wide'
+    ? { label: 'Turn on everywhere', args: 'on --global' }
+    : { label: 'Turn on', args: 'on' }
+}
+
 function statusText(h: Health | null | undefined) {
   if (!h) return 'proxy not running (it starts with the next session, or /roll restart)'
   const state = isOn(h)
@@ -126,45 +145,42 @@ let showStatus = true
 let showControls = true
 // Whether /roll was registered: the .md commands are hidden only then.
 let rollRegistered = false
-// Whether a surface draws the row under the prompt; then the band does not.
+// Whether a surface draws the row under the prompt; then the band stays
+// empty (its buttons already sit in the row).
 let rowDrawn = false
-// Whether the row is drawn anywhere (under the prompt, or in the band): the
-// status is there then, and the engine's status line would only repeat it.
-let rowShown = false
 
-// After the draw that first shows the row (a draw itself never writes): the
-// status line stops repeating it, and `redraw` draws the band again so one
-// drawn before the row under the prompt drops its copy.
-function rowNowShown($: EngineInterface, redraw: boolean) {
-  if (rowShown && !redraw) return
-  rowShown = true
-  $.clock.sleep(0).then(() => {
-    $.ui.status(undefined)
-    if (redraw) $.ui.invalidate('ui.render')
-  }).catch(() => {}) // unloaded before it came due
-}
-
+// The status line under the prompt always carries the status: the row and
+// the band hold the buttons, and the line holds the words.
 async function refreshStatus($: EngineInterface) {
   const h = await health($, await $.session.id())
   await update($, healthNow, () => h ?? null)
-  $.ui.status(showStatus && !rowShown ? statusText(h) : undefined)
+  $.ui.status(showStatus ? statusText(h) : undefined)
 }
 
-// This plugin's /config rows.
+// This plugin's /config rows. The provider names the plugin id, which is the
+// bare name or `<name>@<marketplace>` (as settings.json's pluginConfigs keys
+// it), and the key is `<plugin>.<field>`; match both loosely, the way the
+// proxy's switch.py matches its own options.
+function isOurs(row: { key: string; provider?: { plugin?: string } }) {
+  const provider = row.provider?.plugin ?? ''
+  return provider === PLUGIN || provider.startsWith(`${PLUGIN}@`)
+}
+
 async function optionRows($: EngineInterface) {
   const rows = await $.config.list()
-  return rows.filter(row => row.provider.plugin === PLUGIN)
+  return rows.filter(isOurs)
 }
 
 async function loadSettings($: EngineInterface) {
   const rows = await optionRows($)
   const row = (field: string) => rows.find(r => r.key.endsWith(`.${field}`))
   const retention = row(FIELDS.retention)
+  const retentionOpts = retention?.options
   const settings: Settings = {
     trigger: Number(row(FIELDS.trigger)?.value ?? 100_000),
     target: Number(row(FIELDS.target)?.value ?? 40_000),
     retention: String(retention?.value ?? '14 days'),
-    retentionOptions: [...(retention?.options ?? [])],
+    retentionOptions: [...(retentionOpts?.length ? retentionOpts : RETENTION_OPTIONS)],
   }
   await update($, settingsNow, () => settings)
   return settings
@@ -184,9 +200,10 @@ async function setOption($: EngineInterface, field: Field, raw: string): Promise
   if (!row) return `No /config row for ${field}: is the plugin enabled?`
   let value: string | number
   if (field === 'retention') {
+    const listed = row.options?.length ? row.options : RETENTION_OPTIONS
     const want = raw.trim().toLowerCase().replace(/\s+/g, ' ')
-    const match = (row.options ?? []).find(o => o.toLowerCase() === want)
-    if (!match) return `retention takes one of: ${(row.options ?? []).join(', ')}`
+    const match = listed.find(o => o.toLowerCase() === want)
+    if (!match) return `retention takes one of: ${listed.join(', ')}`
     value = match
   } else {
     value = parseTokens(raw)
@@ -241,7 +258,7 @@ async function run($: EngineInterface, args: string): Promise<string> {
 
   if ((action as Action) === 'restart') {
     await update($, busyNow, () => 'restarting the proxy…')
-    if (!rowShown && showStatus) $.ui.status('restarting the proxy…')
+    if (showStatus) $.ui.status('restarting the proxy…')
     try {
       return await restart($)
     } finally {
@@ -278,12 +295,19 @@ async function paneOpen($: EngineInterface) {
 // the person asking, so the surface places it at any width; where it still is
 // not placed, the box above the prompt shows them instead.
 async function toggleSettings($: EngineInterface) {
-  if (await paneOpen($)) return $.ui.close({ id: PANE })
+  if (await paneOpen($)) {
+    await $.ui.close({ id: PANE })
+    // Closing writes no atom, so redraw for the button label by hand.
+    $.ui.invalidate('ui.render')
+    return
+  }
   if (await read($, isOpen)) return update($, isOpen, () => false)
   await loadSettings($)
   const opened = await $.ui.open({
     id: PANE, title: 'Rolling context settings', focus: true, closeOnEscape: true, rows: 5,
   })
+  // Opening writes no atom either; say "Hide settings" at once.
+  $.ui.invalidate('ui.render')
   if (!opened.isPlaced) {
     await $.ui.close({ id: PANE })
     await update($, isOpen, () => true)
@@ -297,11 +321,14 @@ function settingsBody(
   { Box, Input, Select, Text }: Elements['terminal'],
   settings: Settings,
 ) {
+  const retentionChoices = settings.retentionOptions.includes(settings.retention)
+    ? settings.retentionOptions
+    : [...settings.retentionOptions, settings.retention]
   return (
-    <Box flexDirection="column">
+    <Box flexDirection="column" rowGap={1}>
       <Input
         key="trigger"
-        label="Compress above (tokens) "
+        label="Compact trigger (tokens) "
         value={String(settings.trigger)}
         placeholder="200000"
         onSubmit={v => act($, setOption($, 'trigger', v))}
@@ -316,9 +343,7 @@ function settingsBody(
       <Select
         key="retention"
         label="Delete unused compressions after "
-        options={(settings.retentionOptions.length
-          ? settings.retentionOptions
-          : [settings.retention]).map(o => ({ value: o }))}
+        options={retentionChoices.map(o => ({ value: o }))}
         value={settings.retention}
         onSelect={v => act($, setOption($, 'retention', v))}
       />
@@ -327,19 +352,14 @@ function settingsBody(
   )
 }
 
-// The status, bold in the theme's text color, then the controls; `hint`, the
-// engine's own line where the row replaces it, dim after them.
+// The status, bold in the theme's text color, then the buttons in
+// Toggle/Restart/Settings order; `hint`, the engine's own line where the row
+// replaces it, dim after them.
 async function controlsRow($: EngineInterface, { Box, Button, Text }: Elements['terminal'], hint?: string) {
   const now = await read($, healthNow) // not `h`: that is the JSX factory
   const busy = await read($, busyNow)
   const shown = (await read($, isOpen)) || (await paneOpen($))
-  const toggle = !now
-    ? { label: 'Start proxy', args: 'restart' }
-    : isOn(now)
-      ? { label: 'Turn off', args: 'off' }
-      : now.session?.scope === 'machine-wide'
-        ? { label: 'Turn on everywhere', args: 'on --global' }
-        : { label: 'Turn on', args: 'on' }
+  const toggle = toggleAction(now)
   return (
     <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
       {showStatus ? (
@@ -348,14 +368,14 @@ async function controlsRow($: EngineInterface, { Box, Button, Text }: Elements['
       {showControls ? (
         <Box flexDirection="row" columnGap={1}>
           <Button key="toggle" label={toggle.label} onPress={() => act($, run($, toggle.args))} />
+          {now ? (
+            <Button key="restart" label="Restart" onPress={() => act($, run($, 'restart'))} />
+          ) : null}
           <Button
             key="settings"
             label={shown ? 'Hide settings' : 'Settings'}
             onPress={() => toggleSettings($)}
           />
-          {now ? (
-            <Button key="restart" label="Restart" onPress={() => act($, run($, 'restart'))} />
-          ) : null}
         </Box>
       ) : null}
       {hint ? <Text dimColor>{hint}</Text> : null}
@@ -434,17 +454,21 @@ export const register: Register = (on, options) => {
   })
 
   // The row under the prompt: the status, bold in the theme's text color,
-  // then the controls; the engine's own hint (`? for shortcuts`) follows,
-  // dim, so nothing of it is lost. The Claude desktop app draws that footer
-  // itself and never asks for it; there the band above the prompt carries
-  // the same row (below).
+  // then the buttons in Toggle/Restart/Settings order; the engine's own hint
+  // (`? for shortcuts`) follows, dim, so nothing of it is lost. The Claude
+  // desktop app draws that footer itself and never asks for it; there the
+  // band above the prompt carries one compact line instead (below). The
+  // status line under the prompt keeps the status either way.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     seen($, e)
     if (!showStatus && !showControls) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
     if (!rowDrawn) {
       rowDrawn = true
-      rowNowShown($, true)
+      // The band may have drawn its compact line before this row existed; a
+      // draw never writes, so ask for another pass from the next tick and the
+      // band drops its copy.
+      $.clock.sleep(0).then(() => $.ui.invalidate('ui.render')).catch(() => {}) // unloaded before it came due
     }
     return controlsRow($, $.ui.resolve(e) as Elements['terminal'], e.props.hint)
   })
@@ -459,22 +483,54 @@ export const register: Register = (on, options) => {
     return settingsBody($, els, settings)
   })
 
-  // The band above the prompt: the controls row where the surface draws no
-  // row under the prompt (the desktop app), and the settings, toggled by the
-  // Settings button, where the pane could not be placed.
+  // The pane can close without the Settings button (Esc, its close mark, or
+  // the engine dropping it): pass the close on, then redraw so the button
+  // says "Settings" again. A hook that answers without `next` would keep the
+  // pane open, so the close always passes through.
+  on('ui.close', async ($, e, next) => {
+    if (e.id !== PANE) return next(e)
+    const out = await next(e)
+    $.ui.invalidate('ui.render')
+    return out
+  })
+
+  // The band above the prompt: one compact line ("RC" and the buttons in
+  // Toggle/Restart/Settings order) where the surface draws no row under the
+  // prompt (the desktop app), and the settings, toggled by the Settings
+  // button, where the pane could not be placed. The status itself lives in
+  // the status line, so the band costs a single line; elsewhere it stays
+  // empty apart from the settings fallback. Other mods' band drawings are
+  // kept above ours.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     seen($, e)
     if (e.props.hasSurvey) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
     const els = $.ui.resolve(e) as Elements['terminal']
-    const row = !rowDrawn && (showStatus || showControls)
+    const row = !rowDrawn && showControls
     const settings = (await read($, isOpen)) ? await read($, settingsNow) : null
     if (!row && !settings) return next(e)
-    if (row && showStatus) rowNowShown($, false)
-    const { Box } = els
+    const theirs = await next(e)
+    const { Box, Button, Text } = els
+    const now = row ? await read($, healthNow) : null // not `h`: that is the JSX factory
+    const toggle = row ? toggleAction(now) : null
+    const shown = row ? (await read($, isOpen)) || (await paneOpen($)) : false
     return (
       <Box flexDirection="column">
-        {row ? await controlsRow($, els) : null}
+        {theirs}
+        {row && toggle ? (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+            <Text dimColor>RC</Text>
+            <Button key="toggle" label={toggle.label} onPress={() => act($, run($, toggle.args))} />
+            {now ? (
+              <Button key="restart" label="Restart" onPress={() => act($, run($, 'restart'))} />
+            ) : null}
+            <Button
+              key="settings"
+              label={shown ? 'Hide settings' : 'Settings'}
+              onPress={() => toggleSettings($)}
+            />
+          </Box>
+        ) : null}
         {settings ? settingsBody($, els, settings) : null}
       </Box>
     )

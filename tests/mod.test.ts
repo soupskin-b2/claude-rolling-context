@@ -122,11 +122,13 @@ describe('registration', () => {
 })
 
 // The plugin's /config rows, answered beneath the mod; what it set is kept.
-function config(on: On) {
+// Production names the provider by plugin id (`name@marketplace`), so the
+// default id carries a marketplace suffix; pass the bare name for that shape.
+function config(on: On, id = 'rolling-context@suite') {
   const values: Record<string, number | string> = {
-    'rolling-context.trigger_tokens': 200_000,
-    'rolling-context.target_tokens': 100_000,
-    'rolling-context.retention': '14 days',
+    [`${id}.trigger_tokens`]: 200_000,
+    [`${id}.target_tokens`]: 100_000,
+    [`${id}.retention`]: '14 days',
   }
   const sets: { key: string; value: unknown }[] = []
   on('config.list', async () => ({
@@ -134,7 +136,7 @@ function config(on: On) {
       key, label: key, value,
       kind: typeof value === 'number' ? ('number' as const) : ('choice' as const),
       options: key.endsWith('.retention') ? ['1 day', '14 days', 'Never'] : undefined,
-      provider: { plugin: 'rolling-context', tier: 'user' as const },
+      provider: { plugin: id, tier: 'user' as const },
       isLocked: false,
     })),
   }))
@@ -161,7 +163,7 @@ describe('/roll set', () => {
     world(on, 'Linux', '')
     const sets = config(on)
     const { text } = await $.command.run({ command: 'roll', args: 'set trigger 150k' })
-    expect(sets).toEqual([{ key: 'rolling-context.trigger_tokens', value: 150_000 }])
+    expect(sets).toEqual([{ key: 'rolling-context@suite.trigger_tokens', value: 150_000 }])
     expect(text).toMatch(/150,000 tokens/)
   })
 
@@ -171,7 +173,15 @@ describe('/roll set', () => {
     const bad = await $.command.run({ command: 'roll', args: 'set retention 2 weeks' })
     expect(bad.text).toMatch(/one of: 1 day, 14 days, Never/)
     await $.command.run({ command: 'roll', args: 'set retention never' })
-    expect(sets).toEqual([{ key: 'rolling-context.retention', value: 'Never' }])
+    expect(sets).toEqual([{ key: 'rolling-context@suite.retention', value: 'Never' }])
+  })
+
+  test('finds the rows when the provider names the bare plugin', async ($, on) => {
+    world(on, 'Linux', '')
+    const sets = config(on, 'rolling-context')
+    const { text } = await $.command.run({ command: 'roll', args: 'set trigger 150k' })
+    expect(sets).toEqual([{ key: 'rolling-context.trigger_tokens', value: 150_000 }])
+    expect(text).toMatch(/150,000 tokens/)
   })
 })
 
@@ -206,21 +216,28 @@ describe('the row under the prompt', () => {
       expect(status?.text).toBe('Rolling context: off for this session · 4.7M tokens saved · 40 stored')
       expect(status?.props).toMatchObject({ bold: true, color: 'text' })
       expect((await row.find({ text: '? for shortcuts' }))).toBeDefined()
-      // Drawn in the row, so not repeated on the status line.
+      // The status line keeps the status too: the row holds the buttons, the
+      // line holds the words.
       await $.command.run({ command: 'roll', args: 'status' })
-      expect(w.statuses.at(-1)).toBeUndefined()
+      expect(w.statuses.at(-1)).toBe('off for this session · 4.7M tokens saved · 40 stored')
 
       // The world's /health says off for this session.
       expect((await row.find({ key: 'toggle' }))?.text).toMatch(/Turn on/)
+      expect((await row.find({ key: 'restart' }))?.text).toBe('Restart')
+      expect((await row.find({ key: 'settings' }))?.text).toMatch(/Settings/)
       await row.press({ key: 'toggle' })
       expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['on', '--session', SESSION])
     })
   }
 
-  test('where the host draws no row under the prompt (the desktop app), the band carries it', async ($, on) => {
+  test('where the host draws no row under the prompt (the desktop app), the band carries one compact line', async ($, on) => {
     const w = world(on, 'Linux', 'rolling-context is now ON')
     config(on)
     panes(on)
+    on('ui.render', async ($, e) => {   // the engine's own band: empty
+      const { Box } = $.ui.resolve(e)
+      return h(Box, {})
+    })
     await start($, on)
     await $.command.run({ command: 'roll', args: 'status' })
     expect(w.statuses.at(-1)).toMatch(/^off for this session/) // nothing drawn yet
@@ -231,12 +248,17 @@ describe('the row under the prompt', () => {
         scroll: { offset: 0, bodyRows: 10 }, view: {},
       },
     })
-    const status = await band.find({ type: 'Text', text: /^Rolling context: / })
-    expect(status?.props).toMatchObject({ bold: true, color: 'text' })
+    // One dim "RC", then Toggle/Restart/Settings: the status itself lives in
+    // the status line, so the band costs a single line.
+    const rc = await band.find({ type: 'Text', text: /^RC$/ })
+    expect(rc?.props).toMatchObject({ dimColor: true })
+    expect(await band.find({ type: 'Text', text: /^Rolling context: / })).toBeUndefined()
     expect((await band.find({ key: 'toggle' }))?.text).toMatch(/Turn on/)
-    await w.clock.advance(0)
-    // Shown in the band, so the footer's status line no longer repeats it.
-    expect(w.statuses.at(-1)).toBeUndefined()
+    expect((await band.find({ key: 'restart' }))?.text).toBe('Restart')
+    expect((await band.find({ key: 'settings' }))?.text).toMatch(/Settings/)
+    // The status line keeps the status: the band holds the buttons, the line
+    // holds the words.
+    expect(w.statuses.at(-1)).toMatch(/^off for this session/)
     await band.press({ key: 'toggle' })
     expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['on', '--session', SESSION])
   })
@@ -249,6 +271,7 @@ describe('the row under the prompt', () => {
     const row = await $.ui.mount({ plugin: 'rolling-context', surface: 'desktop', component: 'PromptHint', props: HINT })
     await row.press({ key: 'settings' })
     expect(open.has('settings')).toBe(true)
+    expect((await row.find({ key: 'settings' }))?.text).toBe('Hide settings')
 
     const pane = await $.ui.mount({
       plugin: 'rolling-context', surface: 'desktop', component: 'Pane', requestId: 'settings',
@@ -256,17 +279,59 @@ describe('the row under the prompt', () => {
     } as Parameters<typeof $.ui.mount>[0])
     expect((await pane.find({ key: 'trigger' }))?.type).toBe('Input')
     expect((await pane.find({ key: 'trigger' }))?.props.value).toBe('200000')
+    expect((await pane.find({ key: 'trigger' }))?.props.label).toBe('Compact trigger (tokens) ')
     await pane.input({ key: 'trigger', text: '250000' })
     await pane.input({ key: 'target', text: '120k' })
     await pane.select({ key: 'retention', value: 'Never' })
     expect(sets).toEqual([
-      { key: 'rolling-context.trigger_tokens', value: 250_000 },
-      { key: 'rolling-context.target_tokens', value: 120_000 },
-      { key: 'rolling-context.retention', value: 'Never' },
+      { key: 'rolling-context@suite.trigger_tokens', value: 250_000 },
+      { key: 'rolling-context@suite.target_tokens', value: 120_000 },
+      { key: 'rolling-context@suite.retention', value: 'Never' },
     ])
 
     await row.press({ key: 'settings' })
     expect(open.has('settings')).toBe(false)
+  })
+
+  test('closing Settings with the button says Settings again', async ($, on) => {
+    world(on, 'Linux', '')
+    config(on)
+    const open = panes(on)
+    await start($, on)
+    const row = await $.ui.mount({ plugin: 'rolling-context', surface: 'desktop', component: 'PromptHint', props: HINT })
+    await row.press({ key: 'settings' })
+    expect((await row.find({ key: 'settings' }))?.text).toBe('Hide settings')
+    await row.press({ key: 'settings' })
+    expect(open.has('settings')).toBe(false)
+    // The close writes no atom, so the row relies on the invalidate the
+    // button requests; redraw to the same steady state and read it.
+    await row.redraw()
+    expect((await row.find({ key: 'settings' }))?.text).toBe('Settings')
+  })
+
+  test('where the /config row carries no options, retention still offers every choice', async ($, on) => {
+    world(on, 'Linux', '')
+    on('config.list', async () => ({
+      value: [
+        { key: 'rolling-context@suite.trigger_tokens', label: 'trigger', value: 200_000, kind: 'number' as const, provider: { plugin: 'rolling-context@suite', tier: 'user' as const }, isLocked: false },
+        { key: 'rolling-context@suite.target_tokens', label: 'target', value: 100_000, kind: 'number' as const, provider: { plugin: 'rolling-context@suite', tier: 'user' as const }, isLocked: false },
+        { key: 'rolling-context@suite.retention', label: 'retention', value: '14 days', kind: 'choice' as const, provider: { plugin: 'rolling-context@suite', tier: 'user' as const }, isLocked: false },
+      ],
+    }))
+    on('config.set', async ($, e) => ({ value: e.value }))
+    panes(on)
+    await start($, on)
+    const row = await $.ui.mount({ plugin: 'rolling-context', surface: 'desktop', component: 'PromptHint', props: HINT })
+    await row.press({ key: 'settings' })
+    const pane = await $.ui.mount({
+      plugin: 'rolling-context', surface: 'desktop', component: 'Pane', requestId: 'settings',
+      props: { title: 'Rolling context settings', bodyColumns: 80, scroll: { offset: 0, bodyRows: 5 }, view: {} },
+    } as Parameters<typeof $.ui.mount>[0])
+    const options = (await pane.find({ key: 'retention' }))?.props.options as { value: string }[]
+    expect(options.map(o => o.value)).toEqual([
+      '1 hour', '6 hours', '1 day', '3 days', '7 days', '14 days', '30 days', 'Never',
+    ])
+    await pane.select({ key: 'retention', value: 'Never' }) // accepted, not "takes one of"
   })
 
   test('where no pane can be placed, Settings toggles the box above the prompt', async ($, on) => {
@@ -287,6 +352,8 @@ describe('the row under the prompt', () => {
       },
     })
     expect(await band.find({ key: 'trigger' })).toBeUndefined()
+    expect(await band.find({ key: 'toggle' })).toBeUndefined() // the row below holds the buttons here
+    expect(await band.find({ type: 'Text', text: /^RC$/ })).toBeUndefined()
     await row.press({ key: 'settings' })
     expect(open.size).toBe(0) // the unplaced pane is not left waiting
     expect((await band.find({ key: 'trigger' }))?.type).toBe('Input')

@@ -1,6 +1,6 @@
 {
   "name": "rolling-context",
-  "version": "1.14.3",
+  "version": "1.14.4",
   "description": "Rolling context compression - old messages get summarized, recent messages stay verbatim. Never hit the context wall. /roll shows status and toggles it (per session, or --global) at once, even mid-turn, without a Claude turn - subagents follow the session that spawned them, and nothing already compressed is thrown away. Trigger, target and how long unused compressions are kept are set in /config.",
   "author": {
     "name": "NodeNestor"
@@ -49,7 +49,7 @@
     "controls": {
       "type": "boolean",
       "title": "Show the controls under the prompt",
-      "description": "Buttons beside the status under the prompt: on/off for this session, Settings (these options, in a pane) and Restart. They work mid-turn.",
+      "description": "Buttons beside the status under the prompt (one compact RC line above it where no row under the prompt is drawn): on/off for this session, Restart and Settings (these options, in a pane). They work mid-turn.",
       "default": true
     }
   }
