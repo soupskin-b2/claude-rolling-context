@@ -217,6 +217,30 @@ describe('the row under the prompt', () => {
     })
   }
 
+  test('where the host draws no row under the prompt (the desktop app), the band carries it', async ($, on) => {
+    const w = world(on, 'Linux', 'rolling-context is now ON')
+    config(on)
+    panes(on)
+    await start($, on)
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toMatch(/^off for this session/) // nothing drawn yet
+    const band = await $.ui.mount({
+      plugin: 'rolling-context', surface: 'desktop', component: 'AbovePrompt',
+      props: {
+        hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100,
+        scroll: { offset: 0, bodyRows: 10 }, view: {},
+      },
+    })
+    const status = await band.find({ type: 'Text', text: /^Rolling context: / })
+    expect(status?.props).toMatchObject({ bold: true, color: 'text' })
+    expect((await band.find({ key: 'toggle' }))?.text).toMatch(/Turn on/)
+    await w.clock.advance(0)
+    // Shown in the band, so the footer's status line no longer repeats it.
+    expect(w.statuses.at(-1)).toBeUndefined()
+    await band.press({ key: 'toggle' })
+    expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['on', '--session', SESSION])
+  })
+
   test('Settings opens a pane with number fields, and closes it again', async ($, on) => {
     world(on, 'Linux', '')
     const sets = config(on)

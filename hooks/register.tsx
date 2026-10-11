@@ -9,7 +9,8 @@
 // no Claude turn) and hides them from the menu so /roll is the one listed.
 //
 // A command typed mid-turn may still wait for the turn on some surfaces, so
-// the same controls also sit in the row under the prompt, after the status:
+// the same controls also sit in the row under the prompt (or, in the desktop
+// app, which draws that footer itself, the band above it), after the status:
 // on/off for this session, restart, and Settings, which opens the /config
 // options in a pane (or, where no pane can be placed, a box above the
 // prompt). They act the moment they are pressed.
@@ -125,14 +126,28 @@ let showStatus = true
 let showControls = true
 // Whether /roll was registered: the .md commands are hidden only then.
 let rollRegistered = false
-// Whether a surface draws the row under the prompt: the status is there
-// then, and the engine's status line would only repeat it.
+// Whether a surface draws the row under the prompt; then the band does not.
 let rowDrawn = false
+// Whether the row is drawn anywhere (under the prompt, or in the band): the
+// status is there then, and the engine's status line would only repeat it.
+let rowShown = false
+
+// After the draw that first shows the row (a draw itself never writes): the
+// status line stops repeating it, and `redraw` draws the band again so one
+// drawn before the row under the prompt drops its copy.
+function rowNowShown($: EngineInterface, redraw: boolean) {
+  if (rowShown && !redraw) return
+  rowShown = true
+  $.clock.sleep(0).then(() => {
+    $.ui.status(undefined)
+    if (redraw) $.ui.invalidate('ui.render')
+  }).catch(() => {}) // unloaded before it came due
+}
 
 async function refreshStatus($: EngineInterface) {
   const h = await health($, await $.session.id())
   await update($, healthNow, () => h ?? null)
-  $.ui.status(showStatus && !rowDrawn ? statusText(h) : undefined)
+  $.ui.status(showStatus && !rowShown ? statusText(h) : undefined)
 }
 
 // This plugin's /config rows.
@@ -226,7 +241,7 @@ async function run($: EngineInterface, args: string): Promise<string> {
 
   if ((action as Action) === 'restart') {
     await update($, busyNow, () => 'restarting the proxy…')
-    if (!rowDrawn && showStatus) $.ui.status('restarting the proxy…')
+    if (!rowShown && showStatus) $.ui.status('restarting the proxy…')
     try {
       return await restart($)
     } finally {
@@ -312,6 +327,56 @@ function settingsBody(
   )
 }
 
+// The status, bold in the theme's text color, then the controls; `hint`, the
+// engine's own line where the row replaces it, dim after them.
+async function controlsRow($: EngineInterface, { Box, Button, Text }: Elements['terminal'], hint?: string) {
+  const now = await read($, healthNow) // not `h`: that is the JSX factory
+  const busy = await read($, busyNow)
+  const shown = (await read($, isOpen)) || (await paneOpen($))
+  const toggle = !now
+    ? { label: 'Start proxy', args: 'restart' }
+    : isOn(now)
+      ? { label: 'Turn off', args: 'off' }
+      : now.session?.scope === 'machine-wide'
+        ? { label: 'Turn on everywhere', args: 'on --global' }
+        : { label: 'Turn on', args: 'on' }
+  return (
+    <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+      {showStatus ? (
+        <Text bold color="text">{`Rolling context: ${busy ?? statusText(now)}`}</Text>
+      ) : null}
+      {showControls ? (
+        <Box flexDirection="row" columnGap={1}>
+          <Button key="toggle" label={toggle.label} onPress={() => act($, run($, toggle.args))} />
+          <Button
+            key="settings"
+            label={shown ? 'Hide settings' : 'Settings'}
+            onPress={() => toggleSettings($)}
+          />
+          {now ? (
+            <Button key="restart" label="Restart" onPress={() => act($, run($, 'restart'))} />
+          ) : null}
+        </Box>
+      ) : null}
+      {hint ? <Text dimColor>{hint}</Text> : null}
+    </Box>
+  )
+}
+
+// Which of its sites each surface has asked this plugin to draw, kept in
+// ~/.claude/rolling-context-ui.json: hosts differ (the desktop app never
+// asks for the row under the prompt), and this says what a host offers.
+const sitesSeen = new Set<string>()
+function seen($: EngineInterface, e: { component: string; surface: string }) {
+  const site = `${e.surface}:${e.component}`
+  if (sitesSeen.has(site)) return
+  sitesSeen.add(site)
+  $.clock.sleep(0).then(async () => {
+    await $.fs.write(`${await home($)}/.claude/rolling-context-ui.json`,
+      JSON.stringify({ sites: [...sitesSeen].sort() }, null, 1))
+  }).catch(() => {}) // a diagnostic only
+}
+
 // A command hook that throws would otherwise fall through to the .md
 // command (a Claude turn) or to "no hook answered": say what went wrong.
 function failed(_$: unknown, _e: unknown, next: { error?: { message?: string } }) {
@@ -370,55 +435,22 @@ export const register: Register = (on, options) => {
 
   // The row under the prompt: the status, bold in the theme's text color,
   // then the controls; the engine's own hint (`? for shortcuts`) follows,
-  // dim, so nothing of it is lost.
+  // dim, so nothing of it is lost. The Claude desktop app draws that footer
+  // itself and never asks for it; there the band above the prompt carries
+  // the same row (below).
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    seen($, e)
     if (!showStatus && !showControls) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
     if (!rowDrawn) {
       rowDrawn = true
-      try {
-        $.ui.status(undefined)
-      } catch {
-        // the next refreshStatus clears it
-      }
+      rowNowShown($, true)
     }
-    const now = await read($, healthNow) // not `h`: that is the JSX factory
-    const busy = await read($, busyNow)
-    const shown = (await read($, isOpen)) || (await paneOpen($))
-    const { Box, Button, Text } = $.ui.resolve(e)
-
-    const toggle = !now
-      ? { label: 'Start proxy', args: 'restart' }
-      : isOn(now)
-        ? { label: 'Turn off', args: 'off' }
-        : now.session?.scope === 'machine-wide'
-          ? { label: 'Turn on everywhere', args: 'on --global' }
-          : { label: 'Turn on', args: 'on' }
-
-    return (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-        {showStatus ? (
-          <Text bold color="text">{`Rolling context: ${busy ?? statusText(now)}`}</Text>
-        ) : null}
-        {showControls ? (
-          <Box flexDirection="row" columnGap={1}>
-            <Button key="toggle" label={toggle.label} onPress={() => act($, run($, toggle.args))} />
-            <Button
-              key="settings"
-              label={shown ? 'Hide settings' : 'Settings'}
-              onPress={() => toggleSettings($)}
-            />
-            {now ? (
-              <Button key="restart" label="Restart" onPress={() => act($, run($, 'restart'))} />
-            ) : null}
-          </Box>
-        ) : null}
-        {e.props.hint ? <Text dimColor>{e.props.hint}</Text> : null}
-      </Box>
-    )
+    return controlsRow($, $.ui.resolve(e) as Elements['terminal'], e.props.hint)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    seen($, e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
     // Loaded by the Settings button before it opens the pane; a draw never writes.
     const settings = await read($, settingsNow)
@@ -427,13 +459,24 @@ export const register: Register = (on, options) => {
     return settingsBody($, els, settings)
   })
 
-  // The fallback: the same settings in the box above the prompt, toggled by
-  // the Settings button, where the pane could not be placed.
+  // The band above the prompt: the controls row where the surface draws no
+  // row under the prompt (the desktop app), and the settings, toggled by the
+  // Settings button, where the pane could not be placed.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || !(await read($, isOpen))) return next(e)
+    seen($, e)
+    if (e.props.hasSurvey) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
-    const settings = await read($, settingsNow)
-    if (!settings) return next(e)
-    return settingsBody($, $.ui.resolve(e) as Elements['terminal'], settings)
+    const els = $.ui.resolve(e) as Elements['terminal']
+    const row = !rowDrawn && (showStatus || showControls)
+    const settings = (await read($, isOpen)) ? await read($, settingsNow) : null
+    if (!row && !settings) return next(e)
+    if (row && showStatus) rowNowShown($, false)
+    const { Box } = els
+    return (
+      <Box flexDirection="column">
+        {row ? await controlsRow($, els) : null}
+        {settings ? settingsBody($, els, settings) : null}
+      </Box>
+    )
   })
 }
