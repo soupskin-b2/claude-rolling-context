@@ -175,32 +175,99 @@ describe('/roll set', () => {
   })
 })
 
-describe('the band above the prompt', () => {
+// The panes the engine has open, answered beneath the mod; `placed` false is a
+// surface that cannot place one.
+function panes(on: On, placed = true) {
+  const open = new Set<string>()
+  on('ui.open', async ($, e) => {
+    open.add(e.id)
+    return { value: placed ? { isPlaced: true as const } : { isPlaced: false as const, reason: 'too narrow' } }
+  })
+  on('ui.close', async ($, e) => {
+    open.delete(e.id)
+    return { value: undefined }
+  })
+  on('ui.panes', async () => ({ value: [...open].map(id => ({ id, title: id })) }))
+  return open
+}
+
+const HINT = { isDraft: false, isWorking: true, hint: '? for shortcuts' }
+
+describe('the row under the prompt', () => {
   for (const surface of ['terminal', 'desktop'] as const) {
-    test(`switches this session and changes settings (${surface})`, async ($, on) => {
+    test(`shows the status, then the controls, then the hint (${surface})`, async ($, on) => {
       const w = world(on, 'Linux', 'rolling-context is now ON')
-      const sets = config(on)
+      config(on)
+      panes(on)
       await start($, on)
       await $.command.run({ command: 'roll', args: 'status' }) // the first /health read
-      const band = await $.ui.mount({
-        plugin: 'rolling-context', surface, component: 'AbovePrompt',
-        props: {
-          hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100,
-          scroll: { offset: 0, bodyRows: 10 }, view: {},
-        },
-      })
-      // The world's /health says off for this session.
-      expect((await band.find({ key: 'toggle' }))?.text).toMatch(/Turn on for this session/)
-      await band.press({ key: 'toggle' })
-      expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['on', '--session', SESSION])
+      const row = await $.ui.mount({ plugin: 'rolling-context', surface, component: 'PromptHint', props: HINT })
+      const status = await row.find({ type: 'Text', text: /^Rolling context: / })
+      expect(status?.text).toBe('Rolling context: off for this session · 4.7M tokens saved · 40 stored')
+      expect(status?.props).toMatchObject({ bold: true, color: 'text' })
+      expect((await row.find({ text: '? for shortcuts' }))).toBeDefined()
+      // Drawn in the row, so not repeated on the status line.
+      await $.command.run({ command: 'roll', args: 'status' })
+      expect(w.statuses.at(-1)).toBeUndefined()
 
-      await band.press({ key: 'settings' })
-      await band.select({ key: 'trigger', value: '300000' })
-      await band.select({ key: 'retention', value: 'Never' })
-      expect(sets).toEqual([
-        { key: 'rolling-context.trigger_tokens', value: 300_000 },
-        { key: 'rolling-context.retention', value: 'Never' },
-      ])
+      // The world's /health says off for this session.
+      expect((await row.find({ key: 'toggle' }))?.text).toMatch(/Turn on/)
+      await row.press({ key: 'toggle' })
+      expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['on', '--session', SESSION])
     })
   }
+
+  test('Settings opens a pane with number fields, and closes it again', async ($, on) => {
+    world(on, 'Linux', '')
+    const sets = config(on)
+    const open = panes(on)
+    await start($, on)
+    const row = await $.ui.mount({ plugin: 'rolling-context', surface: 'desktop', component: 'PromptHint', props: HINT })
+    await row.press({ key: 'settings' })
+    expect(open.has('settings')).toBe(true)
+
+    const pane = await $.ui.mount({
+      plugin: 'rolling-context', surface: 'desktop', component: 'Pane', requestId: 'settings',
+      props: { title: 'Rolling context settings', bodyColumns: 80, scroll: { offset: 0, bodyRows: 5 }, view: {} },
+    } as Parameters<typeof $.ui.mount>[0])
+    expect((await pane.find({ key: 'trigger' }))?.type).toBe('Input')
+    expect((await pane.find({ key: 'trigger' }))?.props.value).toBe('200000')
+    await pane.input({ key: 'trigger', text: '250000' })
+    await pane.input({ key: 'target', text: '120k' })
+    await pane.select({ key: 'retention', value: 'Never' })
+    expect(sets).toEqual([
+      { key: 'rolling-context.trigger_tokens', value: 250_000 },
+      { key: 'rolling-context.target_tokens', value: 120_000 },
+      { key: 'rolling-context.retention', value: 'Never' },
+    ])
+
+    await row.press({ key: 'settings' })
+    expect(open.has('settings')).toBe(false)
+  })
+
+  test('where no pane can be placed, Settings toggles the box above the prompt', async ($, on) => {
+    world(on, 'Linux', '')
+    config(on)
+    const open = panes(on, false)
+    on('ui.render', async ($, e) => {   // the engine's own band: empty
+      const { Box } = $.ui.resolve(e)
+      return h(Box, {})
+    })
+    await start($, on)
+    const row = await $.ui.mount({ plugin: 'rolling-context', surface: 'terminal', component: 'PromptHint', props: HINT })
+    const band = await $.ui.mount({
+      plugin: 'rolling-context', surface: 'terminal', component: 'AbovePrompt',
+      props: {
+        hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 100,
+        scroll: { offset: 0, bodyRows: 10 }, view: {},
+      },
+    })
+    expect(await band.find({ key: 'trigger' })).toBeUndefined()
+    await row.press({ key: 'settings' })
+    expect(open.size).toBe(0) // the unplaced pane is not left waiting
+    expect((await band.find({ key: 'trigger' }))?.type).toBe('Input')
+    expect(await band.find({ key: 'toggle' })).toBeUndefined() // settings only
+    await row.press({ key: 'settings' })
+    expect(await band.find({ key: 'trigger' })).toBeUndefined()
+  })
 })

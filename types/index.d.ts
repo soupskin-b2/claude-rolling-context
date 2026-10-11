@@ -12,7 +12,7 @@ export type RollingContextHealth = {
   session?: { enabled: boolean; scope: string }
 }
 
-/** The /config options as the band's settings row shows them. */
+/** The /config options as the settings pane shows them. */
 export type RollingContextSettings = {
   trigger: number
   target: number
@@ -26,6 +26,8 @@ declare module 'claude-code' {
       health: RollingContextHealth | null
       isOpen: boolean
       settings: RollingContextSettings | null
+      /** What the row says while a control works (a restart), else null. */
+      busy: string | null
     }
   }
 }

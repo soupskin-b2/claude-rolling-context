@@ -9,12 +9,15 @@
 // no Claude turn) and hides them from the menu so /roll is the one listed.
 //
 // A command typed mid-turn may still wait for the turn on some surfaces, so
-// the same controls also sit in a band above the prompt: on/off for this
-// session and the /config options, which act the moment they are pressed.
+// the same controls also sit in the row under the prompt, after the status:
+// on/off for this session, restart, and Settings, which opens the /config
+// options in a pane (or, where no pane can be placed, a box above the
+// prompt). They act the moment they are pressed.
 //
-// The status line and the band read the proxy's /health for this session.
+// The row (or, on a surface without one, the status line) and the settings
+// read the proxy's /health for this session.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { Elements, EngineInterface, Register } from 'claude-code'
 
 import type { RollingContextHealth as Health, RollingContextSettings as Settings } from '../types'
 
@@ -25,9 +28,10 @@ const LEGACY = ['status', 'on', 'off', 'restart'].map(a => `${PLUGIN}:${a}`)
 const STATUS_EVERY_MS = 30_000
 const USAGE =
   'Usage: /roll [status|on|off|restart] [--global], or /roll set <trigger|target|retention> <value>'
+const PANE = 'settings'
 
 
-// The /config options the band and /roll set change, by the names /roll set takes.
+// The /config options the settings and /roll set change, by the names /roll set takes.
 const FIELDS = {
   trigger: 'trigger_tokens',
   target: 'target_tokens',
@@ -36,13 +40,13 @@ const FIELDS = {
 type Field = keyof typeof FIELDS
 
 
-// What the band draws from: set by refreshStatus and the settings loader.
+// What the row and the settings draw from: set by refreshStatus, the settings
+// loader and the controls. isOpen is the fallback box above the prompt, shown
+// only where the settings pane could not be placed.
 const healthNow = atom({ plugin: 'rolling-context', key: 'health' } as const, null)
 const isOpen = atom({ plugin: 'rolling-context', key: 'isOpen' } as const, false)
 const settingsNow = atom({ plugin: 'rolling-context', key: 'settings' } as const, null)
-
-const TRIGGER_PRESETS = [50_000, 100_000, 150_000, 200_000, 300_000, 500_000, 800_000]
-const TARGET_PRESETS = [20_000, 40_000, 60_000, 80_000, 100_000, 150_000, 200_000]
+const busyNow = atom({ plugin: 'rolling-context', key: 'busy' } as const, null)
 
 const compact = (n: number) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n)
@@ -121,11 +125,14 @@ let showStatus = true
 let showControls = true
 // Whether /roll was registered: the .md commands are hidden only then.
 let rollRegistered = false
+// Whether a surface draws the row under the prompt: the status is there
+// then, and the engine's status line would only repeat it.
+let rowDrawn = false
 
 async function refreshStatus($: EngineInterface) {
   const h = await health($, await $.session.id())
   await update($, healthNow, () => h ?? null)
-  if (showStatus) $.ui.status(statusText(h))
+  $.ui.status(showStatus && !rowDrawn ? statusText(h) : undefined)
 }
 
 // This plugin's /config rows.
@@ -177,6 +184,30 @@ async function setOption($: EngineInterface, field: Field, raw: string): Promise
   return `${field} set to ${shown}. The proxy reads it on its next request.`
 }
 
+async function restart($: EngineInterface): Promise<string> {
+  const root = $.plugin.root
+  const env = { ROLLING_CONTEXT_FORCE_RESTART: '1' }
+  try {
+    if (await isWindows($)) {
+      await $.process.run(
+        ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+          `${root}/hooks/start-proxy.ps1`],
+        { env, timeoutMs: 60_000 },
+      )
+    } else {
+      await $.process.run(['bash', `${root}/hooks/start-proxy.sh`], { env, timeoutMs: 60_000 })
+    }
+  } catch (err) {
+    return `Restart failed to run: ${String(err)}`
+  }
+  try {
+    const log = await $.fs.read(`${await home($)}/.claude/rolling-context-hook.log`)
+    return log.trimEnd().split(/\r?\n/).slice(-6).join('\n')
+  } catch {
+    return '(no hook log found)'
+  }
+}
+
 async function run($: EngineInterface, args: string): Promise<string> {
   const words = args.trim().split(/\s+/).filter(Boolean)
   const verb = words.findIndex(w => !w.startsWith('-'))
@@ -185,7 +216,6 @@ async function run($: EngineInterface, args: string): Promise<string> {
   if (!(ACTIONS as readonly string[]).includes(action)) {
     return `Unknown action "${action}". ${USAGE}`
   }
-  const root = $.plugin.root
 
   if ((action as Action) === 'set') {
     const rest = words.slice(verb + 1)
@@ -195,36 +225,19 @@ async function run($: EngineInterface, args: string): Promise<string> {
   }
 
   if ((action as Action) === 'restart') {
-    $.ui.status('restarting the proxy…')
-    const env = { ROLLING_CONTEXT_FORCE_RESTART: '1' }
+    await update($, busyNow, () => 'restarting the proxy…')
+    if (!rowDrawn && showStatus) $.ui.status('restarting the proxy…')
     try {
-      if (await isWindows($)) {
-        await $.process.run(
-          ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-            `${root}/hooks/start-proxy.ps1`],
-          { env, timeoutMs: 60_000 },
-        )
-      } else {
-        await $.process.run(['bash', `${root}/hooks/start-proxy.sh`], { env, timeoutMs: 60_000 })
-      }
-    } catch (err) {
+      return await restart($)
+    } finally {
+      await update($, busyNow, () => null)
       await refreshStatus($)
-      return `Restart failed to run: ${String(err)}`
     }
-    let tail = ''
-    try {
-      const log = await $.fs.read(`${await home($)}/.claude/rolling-context-hook.log`)
-      tail = log.trimEnd().split(/\r?\n/).slice(-6).join('\n')
-    } catch {
-      tail = '(no hook log found)'
-    }
-    await refreshStatus($)
-    return tail
   }
 
   const r = await runPython(
     $,
-    [`${root}/proxy/switch.py`, action, ...flags, '--session', await $.session.id()],
+    [`${$.plugin.root}/proxy/switch.py`, action, ...flags, '--session', await $.session.id()],
     { ROLLING_CONTEXT_VIA: 'mod', PYTHONIOENCODING: 'utf-8' },
   )
   await refreshStatus($)
@@ -232,7 +245,7 @@ async function run($: EngineInterface, args: string): Promise<string> {
   return r.exitCode === 0 ? out : `switch.py exited ${r.exitCode}:\n${out}`
 }
 
-// A band control: do it, and say how it went in a toast.
+// A control: do it, and say how it went in a toast.
 async function act($: EngineInterface, work: Promise<string>) {
   try {
     const out = await work
@@ -242,21 +255,67 @@ async function act($: EngineInterface, work: Promise<string>) {
   }
 }
 
+async function paneOpen($: EngineInterface) {
+  return (await $.ui.panes()).some(p => p.id === PANE)
+}
+
+// Settings: a pane of their own, closed again by the same button. A press is
+// the person asking, so the surface places it at any width; where it still is
+// not placed, the box above the prompt shows them instead.
 async function toggleSettings($: EngineInterface) {
-  if (!(await read($, isOpen))) await loadSettings($)
-  await update($, isOpen, v => !v)
+  if (await paneOpen($)) return $.ui.close({ id: PANE })
+  if (await read($, isOpen)) return update($, isOpen, () => false)
+  await loadSettings($)
+  const opened = await $.ui.open({
+    id: PANE, title: 'Rolling context settings', focus: true, closeOnEscape: true, rows: 5,
+  })
+  if (!opened.isPlaced) {
+    await $.ui.close({ id: PANE })
+    await update($, isOpen, () => true)
+  }
+}
+
+// The settings, in the pane or the fallback box: the two token counts as
+// number fields (Enter sets one; 150k works too) and the retention choice.
+function settingsBody(
+  $: EngineInterface,
+  { Box, Input, Select, Text }: Elements['terminal'],
+  settings: Settings,
+) {
+  return (
+    <Box flexDirection="column">
+      <Input
+        key="trigger"
+        label="Compress above (tokens) "
+        value={String(settings.trigger)}
+        placeholder="200000"
+        onSubmit={v => act($, setOption($, 'trigger', v))}
+      />
+      <Input
+        key="target"
+        label="Keep verbatim (tokens) "
+        value={String(settings.target)}
+        placeholder="100000"
+        onSubmit={v => act($, setOption($, 'target', v))}
+      />
+      <Select
+        key="retention"
+        label="Delete unused compressions after "
+        options={(settings.retentionOptions.length
+          ? settings.retentionOptions
+          : [settings.retention]).map(o => ({ value: o }))}
+        value={settings.retention}
+        onSelect={v => act($, setOption($, 'retention', v))}
+      />
+      <Text dimColor>Enter sets a number; the proxy reads it on its next request.</Text>
+    </Box>
+  )
 }
 
 // A command hook that throws would otherwise fall through to the .md
 // command (a Claude turn) or to "no hook answered": say what went wrong.
 function failed(_$: unknown, _e: unknown, next: { error?: { message?: string } }) {
   return { text: `rolling-context: ${next.error?.message ?? 'the command failed'}` }
-}
-
-// The presets, with the current value among them so the Select can show it.
-function choices(presets: number[], current: number) {
-  const all = presets.includes(current) ? presets : [...presets, current].sort((a, b) => a - b)
-  return all.map(n => ({ value: String(n), label: `${compact(n)} tokens` }))
 }
 
 export const register: Register = (on, options) => {
@@ -309,67 +368,72 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // The band above the prompt: the state, an on/off switch and the settings.
-  // Its controls act when pressed, mid-turn included; the engine's [-]
-  // folds it away.
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (!showControls || e.props.hasSurvey) return next(e)
+  // The row under the prompt: the status, bold in the theme's text color,
+  // then the controls; the engine's own hint (`? for shortcuts`) follows,
+  // dim, so nothing of it is lost.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (!showStatus && !showControls) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
+    if (!rowDrawn) {
+      rowDrawn = true
+      try {
+        $.ui.status(undefined)
+      } catch {
+        // the next refreshStatus clears it
+      }
+    }
     const now = await read($, healthNow) // not `h`: that is the JSX factory
-    const open = await read($, isOpen)
-    const settings = await read($, settingsNow)
-    const { Box, Button, Select, Text } = $.ui.resolve(e)
+    const busy = await read($, busyNow)
+    const shown = (await read($, isOpen)) || (await paneOpen($))
+    const { Box, Button, Text } = $.ui.resolve(e)
 
     const toggle = !now
       ? { label: 'Start proxy', args: 'restart' }
       : isOn(now)
-        ? { label: 'Turn off for this session', args: 'off' }
+        ? { label: 'Turn off', args: 'off' }
         : now.session?.scope === 'machine-wide'
-          ? { label: 'Turn on for all sessions', args: 'on --global' }
-          : { label: 'Turn on for this session', args: 'on' }
+          ? { label: 'Turn on everywhere', args: 'on --global' }
+          : { label: 'Turn on', args: 'on' }
 
     return (
-      <Box flexDirection="column">
-        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-          <Text bold>Rolling context</Text>
-          <Text dimColor>{statusText(now)}</Text>
-          <Button key="toggle" label={toggle.label} onPress={() => act($, run($, toggle.args))} />
-          <Button
-            key="settings"
-            label={open ? 'Hide settings' : 'Settings'}
-            dimColor
-            onPress={() => toggleSettings($)}
-          />
-        </Box>
-        {open && settings ? (
-          <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
-            <Select
-              key="trigger"
-              label="Compress above "
-              options={choices(TRIGGER_PRESETS, settings.trigger)}
-              value={String(settings.trigger)}
-              onSelect={v => act($, setOption($, 'trigger', v))}
+      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+        {showStatus ? (
+          <Text bold color="text">{`Rolling context: ${busy ?? statusText(now)}`}</Text>
+        ) : null}
+        {showControls ? (
+          <Box flexDirection="row" columnGap={1}>
+            <Button key="toggle" label={toggle.label} onPress={() => act($, run($, toggle.args))} />
+            <Button
+              key="settings"
+              label={shown ? 'Hide settings' : 'Settings'}
+              onPress={() => toggleSettings($)}
             />
-            <Select
-              key="target"
-              label="Keep verbatim "
-              options={choices(TARGET_PRESETS, settings.target)}
-              value={String(settings.target)}
-              onSelect={v => act($, setOption($, 'target', v))}
-            />
-            <Select
-              key="retention"
-              label="Delete unused compressions after "
-              options={(settings.retentionOptions.length
-                ? settings.retentionOptions
-                : [settings.retention]).map(o => ({ value: o }))}
-              value={settings.retention}
-              onSelect={v => act($, setOption($, 'retention', v))}
-            />
-            <Button key="restart" label="Restart proxy" dimColor onPress={() => act($, run($, 'restart'))} />
+            {now ? (
+              <Button key="restart" label="Restart" onPress={() => act($, run($, 'restart'))} />
+            ) : null}
           </Box>
         ) : null}
+        {e.props.hint ? <Text dimColor>{e.props.hint}</Text> : null}
       </Box>
     )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
+    // Loaded by the Settings button before it opens the pane; a draw never writes.
+    const settings = await read($, settingsNow)
+    const els = $.ui.resolve(e) as Elements['terminal']
+    if (!settings) return <els.Text dimColor>Loading the settings…</els.Text>
+    return settingsBody($, els, settings)
+  })
+
+  // The fallback: the same settings in the box above the prompt, toggled by
+  // the Settings button, where the pane could not be placed.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey || !(await read($, isOpen))) return next(e)
+    if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
+    const settings = await read($, settingsNow)
+    if (!settings) return next(e)
+    return settingsBody($, $.ui.resolve(e) as Elements['terminal'], settings)
   })
 }
