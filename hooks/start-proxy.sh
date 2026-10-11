@@ -160,8 +160,24 @@ _wait_until_idle() {
     echo "$d"
 }
 
+_request_drain() {
+    # Ask the running proxy to hand over: it stops listening now and finishes
+    # its open requests on its own, instead of a signal that cuts them.
+    [ "$($PYTHON_CMD "$SCRIPT_DIR/probe.py" "$PORT" 2 drain 2>/dev/null | tr -d '[:space:]')" = "draining" ]
+}
+
 _replace_running_proxy() {
-    _clear_recorded_proxy serving
+    # $1 = wait: too old to hand over, so give it a short wait for idle first.
+    if _request_drain; then
+        log "Proxy is handing over: it stopped listening and finishes its open requests on its own"
+        # It may hold the ports a moment longer while it saves the store:
+        # tell the new proxy to keep trying the bind rather than exit.
+        export ROLLING_CONTEXT_SUCCESSOR=1
+        rm -f "$PIDFILE" "$VERFILE"
+    else
+        [ "$1" = "wait" ] && _wait_until_idle 6 >/dev/null
+        _clear_recorded_proxy serving
+    fi
     # The old proxy owns the port until it actually exits. Starting on top
     # of it would just lose the bind and leave the old version serving
     # while the log claimed a restart.
@@ -190,15 +206,15 @@ _replace_running_proxy() {
 # cut every session's in-flight stream (nestor-plugins issue #1). Policy now:
 # never downgrade, and only replace an older proxy when nothing is in flight.
 # ROLLING_CONTEXT_FORCE_RESTART=1 (the /rolling-context:restart command)
-# restarts regardless of version, still waiting briefly for idle.
+# restarts regardless of version: a proxy that can hand over (POST /drain)
+# finishes its open requests itself; an older one gets a short wait for idle.
 FORCE="${ROLLING_CONTEXT_FORCE_RESTART:-}"
 DECISION=$(_decide 2)
 case "$DECISION" in
     same)
         if [ -n "$FORCE" ]; then
-            DECISION=$(_wait_until_idle 6)
-            log "Forced restart of v$CURRENT_VERSION (${DECISION})"
-            _replace_running_proxy
+            log "Forced restart of v$CURRENT_VERSION"
+            _replace_running_proxy wait
         else
             log "Proxy already running and healthy on :$PORT (v$CURRENT_VERSION)"
             exit 0
@@ -206,9 +222,8 @@ case "$DECISION" in
         ;;
     newer\ *)
         if [ -n "$FORCE" ]; then
-            DECISION=$(_wait_until_idle 6)
             log "Forced restart: replacing v${DECISION#newer } with v$CURRENT_VERSION"
-            _replace_running_proxy
+            _replace_running_proxy wait
         else
             log "Proxy v${DECISION#newer } on :$PORT is newer than this plugin (v$CURRENT_VERSION) — leaving it alone, never downgrading. This session uses it as is."
             exit 0
@@ -225,7 +240,7 @@ case "$DECISION" in
         case "$DECISION" in
             "older "*" idle"|"older "*" busy "*)
                 if [ "$3" = "busy" ] && [ -z "$FORCE" ]; then
-                    log "Deferring upgrade: proxy v$RUNNING still has $4 in flight ($5). This session uses it as is; the upgrade to v$CURRENT_VERSION happens at the next session start that finds it idle, or now via /rolling-context:restart."
+                    log "Deferring upgrade: proxy v$RUNNING still has $4 in flight ($5). This session uses it as is; the upgrade to v$CURRENT_VERSION happens at the next session start that finds it idle, or now via /roll restart."
                     exit 0
                 fi
                 log "Upgrading proxy v$RUNNING -> v$CURRENT_VERSION (${3:-idle}${FORCE:+, forced})"

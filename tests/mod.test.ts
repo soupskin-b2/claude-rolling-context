@@ -1,4 +1,4 @@
-// Tests for hooks/register.ts, run by `claude plugin test`.
+// Tests for hooks/register.tsx, run by `claude plugin test`.
 // Nothing here touches a real process, the network or the disk: the test's
 // hooks answer $.process.run, $.http.fetch and $.session.id beneath the mod.
 import { describe, expect, mock, test } from 'claude-code/testing'
@@ -103,4 +103,88 @@ describe('registration', () => {
     on('command.register', async () => ({ deny: '"/roll" refused: it is taken' }))
     expect(await legacyHidden($, on)).toBe(false)
   })
+})
+
+// The plugin's /config rows, answered beneath the mod; what it set is kept.
+function config(on: On) {
+  const values: Record<string, number | string> = {
+    'rolling-context.trigger_tokens': 200_000,
+    'rolling-context.target_tokens': 100_000,
+    'rolling-context.retention': '14 days',
+  }
+  const sets: { key: string; value: unknown }[] = []
+  on('config.list', async () => ({
+    value: Object.entries(values).map(([key, value]) => ({
+      key, label: key, value,
+      kind: typeof value === 'number' ? ('number' as const) : ('choice' as const),
+      options: key.endsWith('.retention') ? ['1 day', '14 days', 'Never'] : undefined,
+      provider: { plugin: 'rolling-context', tier: 'user' as const },
+      isLocked: false,
+    })),
+  }))
+  on('config.set', async ($, e) => {
+    sets.push({ key: e.key, value: e.value })
+    values[e.key] = e.value as number | string
+    return { value: e.value }
+  })
+  return sets
+}
+
+// A session started as the engine starts one, /roll registered.
+async function start($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
+  on('ui.log', async () => ({ value: undefined }))
+  on('ui.toast', async () => ({ value: undefined }))
+  on('ui.invalidate', async () => ({ value: undefined }))
+  on('command.register', async ($, e) => ({ value: { command: e.name } }))
+  on('session.start', async ($, e) => e)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+}
+
+describe('/roll set', () => {
+  test('sets a token count in /config, k suffix and all', async ($, on) => {
+    world(on, 'Linux', '')
+    const sets = config(on)
+    const { text } = await $.command.run({ command: 'roll', args: 'set trigger 150k' })
+    expect(sets).toEqual([{ key: 'rolling-context.trigger_tokens', value: 150_000 }])
+    expect(text).toMatch(/150,000 tokens/)
+  })
+
+  test('retention takes only its listed choices, case aside', async ($, on) => {
+    world(on, 'Linux', '')
+    const sets = config(on)
+    const bad = await $.command.run({ command: 'roll', args: 'set retention 2 weeks' })
+    expect(bad.text).toMatch(/one of: 1 day, 14 days, Never/)
+    await $.command.run({ command: 'roll', args: 'set retention never' })
+    expect(sets).toEqual([{ key: 'rolling-context.retention', value: 'Never' }])
+  })
+})
+
+describe('the band above the prompt', () => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`switches this session and changes settings (${surface})`, async ($, on) => {
+      const w = world(on, 'Linux', 'rolling-context is now ON')
+      const sets = config(on)
+      await start($, on)
+      await $.command.run({ command: 'roll', args: 'status' }) // the first /health read
+      const band = await $.ui.mount({
+        plugin: 'rolling-context', surface, component: 'AbovePrompt',
+        props: {
+          hasSurvey: false, isWorking: true, maxRows: 10, bodyColumns: 100,
+          scroll: { offset: 0, bodyRows: 10 }, view: {},
+        },
+      })
+      // The world's /health says off for this session.
+      expect((await band.find({ key: 'toggle' }))?.text).toMatch(/Turn on for this session/)
+      await band.press({ key: 'toggle' })
+      expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['on', '--session', SESSION])
+
+      await band.press({ key: 'settings' })
+      await band.select({ key: 'trigger', value: '300000' })
+      await band.select({ key: 'retention', value: 'Never' })
+      expect(sets).toEqual([
+        { key: 'rolling-context.trigger_tokens', value: 300_000 },
+        { key: 'rolling-context.retention', value: 'Never' },
+      ])
+    })
+  }
 })

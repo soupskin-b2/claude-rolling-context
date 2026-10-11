@@ -266,6 +266,12 @@ def write_pidfile(home, value, version=None):
 def start_proxy(home, port, plugin_root=ROOT):
     """Start the proxy the way the hook does, and wait for it to serve."""
     env = dict(os.environ)
+    # Run from inside a wired Claude Code session, the environment carries
+    # the real ROLLING_CONTEXT_UPSTREAM (and port, trigger...): it would beat
+    # the fake home's settings and send test requests to the real API.
+    for k in list(env):
+        if k.startswith("ROLLING_CONTEXT_"):
+            env.pop(k)
     env.update(HOME=home, USERPROFILE=home, ROLLING_CONTEXT_PORT=str(port),
                ROLLING_CONTEXT_MITM_PORT=mitm_port(port))
     log = open(os.path.join(home, ".claude", "manual-proxy.log"), "ab")

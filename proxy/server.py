@@ -91,6 +91,22 @@ MITM_PORT = int(os.environ.get("ROLLING_CONTEXT_MITM_PORT") or "5590")
 CA_DIR = os.path.join(os.path.expanduser("~"), ".claude", "proxy-ca")
 # How long a SIGTERM waits for in-flight requests before the process exits.
 DRAIN_SECONDS = float(os.environ.get("ROLLING_CONTEXT_DRAIN_SECONDS") or "20")
+# How long a draining proxy waits for its successor before it exits anyway.
+SUCCESSOR_WAIT_SECONDS = 15.0
+# Set by main(): starts a drain from a request handler (POST /drain).
+_drain_handler = None
+
+
+def _successor_listening():
+    """True once another of our proxies answers /health on our port."""
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", LISTEN_PORT, timeout=0.5)
+        conn.request("GET", "/health")
+        body = json.loads(conn.getresponse().read() or b"{}")
+        conn.close()
+    except Exception:
+        return False
+    return body.get("service") == "rolling-context" and body.get("pid") != os.getpid()
 
 
 def _plugin_version() -> str:
@@ -120,13 +136,40 @@ VERSION = _plugin_version()
 _inflight = 0
 _inflight_lock = threading.Lock()
 _draining = False
+# Set once a successor has been handed the store: from then on this process
+# leaves store-<port>.json to it.
+_handed_over = False
+
+# Streams that stay open for as long as a client is connected - the desktop
+# app's session event stream (/v1/code/sessions/<id>/worker/events/stream)
+# reconnects whenever it drops. Counting them as in flight made the proxy
+# look permanently busy, so an upgrade never found it idle. They are left
+# out: a drain cuts them last, once a successor is listening for the
+# reconnect.
+_LONG_LIVED = ("/events/stream",)
+
+
+def _long_lived(path):
+    path = urlparse(path).path
+    return any(path.endswith(tail) for tail in _LONG_LIVED)
+
+
+_long_lived_open = 0
 
 
 def _track_request(method):
     """Run one BaseHTTPRequestHandler do_* body under the in-flight counter."""
     def wrap(fn):
         def inner(self):
-            global _inflight
+            global _inflight, _long_lived_open
+            if _long_lived(self.path):
+                with _inflight_lock:
+                    _long_lived_open += 1
+                try:
+                    return fn(self)
+                finally:
+                    with _inflight_lock:
+                        _long_lived_open -= 1
             with _inflight_lock:
                 _inflight += 1
             try:
@@ -712,6 +755,8 @@ def _persist_loop():
         _persist_dirty.wait()
         time.sleep(1.0)               # coalesce bursts (promotion + chain + flag)
         _persist_dirty.clear()
+        if _handed_over:
+            continue
         try:
             _write_state()
         except Exception as e:
@@ -974,8 +1019,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _tracked_get(self):
         self._proxy_raw("GET")
 
-    @_track_request("POST")
     def do_POST(self):
+        if urlparse(self.path).path == "/drain":
+            self._handle_drain()
+        else:
+            self._tracked_post()
+
+    def _handle_drain(self):
+        """Hand over to a successor: the start hook's restart, in place of a kill.
+
+        Windows has no SIGTERM to deliver - a kill there is TerminateProcess,
+        which cuts every open stream at once. Here this process stops
+        listening, so the successor can bind, and finishes what it has open.
+        A browser page could POST here too; it always sends Origin and cannot
+        set the custom header without a preflight, so either refuses it.
+        """
+        log.info("[REQ] POST /drain")
+        ok = not self.headers.get("Origin") and self.headers.get("X-Rolling-Context") == "drain"
+        body = json.dumps({"draining": ok, "pid": os.getpid(),
+                           "in_flight": _inflight}).encode()
+        self.send_response(200 if ok else 403)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        if ok and _drain_handler is not None:
+            _drain_handler("Drain requested", handover=True)
+
+    @_track_request("POST")
+    def _tracked_post(self):
         log.info(f"[REQ] POST {self.path}")
         if self.path.startswith("/v1/messages"):
             self._handle_messages()
@@ -1077,6 +1150,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # In-flight client requests (streams included). The start hook
             # refuses to replace a proxy while this is non-zero.
             "active_requests": _inflight,
+            "can_drain": True,
             "draining": _draining,
             "cache_integrity": dict(_cache_stats),
         }
@@ -1638,12 +1712,21 @@ def main():
     if swept:
         log.info(f"  Removed {swept} stale per-session state file(s)")
 
-    try:
-        server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
-    except OSError as e:
-        log.error(f"Port {LISTEN_PORT} is already in use ({e}); another proxy "
-                  f"is serving it. Exiting.")
-        sys.exit(1)
+    # Started by a hook right after it asked the running proxy to hand over
+    # (POST /drain): that proxy may still be saving the store and letting go
+    # of the port, so keep trying for a while instead of exiting at once.
+    bind_until = time.time() + (10 if os.environ.get("ROLLING_CONTEXT_SUCCESSOR") else 0)
+    while True:
+        try:
+            server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+            break
+        except OSError as e:
+            if time.time() < bind_until:
+                time.sleep(0.2)
+                continue
+            log.error(f"Port {LISTEN_PORT} is already in use ({e}); another proxy "
+                      f"is serving it. Exiting.")
+            sys.exit(1)
 
     # Start the MITM front-end. Claude Code connects to it via HTTPS_PROXY,
     # believing it is talking to api.anthropic.com; the front-end terminates TLS
@@ -1667,7 +1750,8 @@ def main():
         ):
             _extra = [_uh]
 
-        mitm_frontend.start_in_thread(MITM_PORT, CA_DIR, _on_terminated, log=log.info, extra_hosts=_extra)
+        mitm_frontend.start_in_thread(MITM_PORT, CA_DIR, _on_terminated, log=log.info,
+                                      extra_hosts=_extra, local_ports=(LISTEN_PORT,))
         log.info(f"  MITM front-end: 127.0.0.1:{MITM_PORT} (HTTPS_PROXY entrypoint)"
                  + (f", also intercepting {_extra[0]}" if _extra else ""))
     except OSError as e:
@@ -1680,32 +1764,58 @@ def main():
     except Exception as e:
         log.warning(f"MITM front-end disabled ({e!r}); HTTPS_PROXY entrypoint unavailable")
 
-    def _drain_and_exit(reason):
+    def _drain_and_exit(reason, handover=False):
         # Stop taking new connections, let what is mid-flight finish, then
         # leave. New sessions get ConnectionRefused for the second or two
         # until the replacement binds — the SDK retries connection errors —
         # whereas a stream cut in half is surfaced to the user as an API error.
-        global _draining
+        global _draining, _handed_over
         _draining = True
         log.info(f"{reason}: draining {_inflight} in-flight request(s) (up to {DRAIN_SECONDS}s)")
+        # The successor loads the store when it starts: write it now, and
+        # leave the file to the successor from here on.
+        try:
+            _write_state()
+        except Exception as e:
+            log.warning(f"[STORE] Could not save {STORE_PATH} before handing over: {e}")
+        _handed_over = True
         try:
             import mitm_frontend
             mitm_frontend.close_listener()
         except Exception:
             pass
         server.shutdown()
+        # Release the port itself, not just the accept loop, so the
+        # successor can bind while this process finishes its requests.
+        try:
+            server.socket.close()
+        except OSError:
+            pass
         deadline = time.time() + DRAIN_SECONDS
         while _inflight > 0 and time.time() < deadline:
             time.sleep(0.1)
+        # Long-lived streams reconnect when cut: on a handover, cut them only
+        # once the successor is there to take the reconnect, not into a
+        # closed port. A plain stop (SIGTERM) has no successor to wait for.
+        if handover and _long_lived_open:
+            deadline = time.time() + SUCCESSOR_WAIT_SECONDS
+            while time.time() < deadline and not _successor_listening():
+                time.sleep(0.25)
         log.info(f"Exiting with {_inflight} request(s) still open")
         os._exit(0)
 
-    def _on_signal(signum, _frame):
+    def _request_drain(reason, handover=False):
         # Never call server.shutdown() from the thread running serve_forever.
         if _draining:
             return
-        threading.Thread(target=_drain_and_exit, args=(f"Signal {signum}",),
+        threading.Thread(target=_drain_and_exit, args=(reason, handover),
                          daemon=True).start()
+
+    global _drain_handler
+    _drain_handler = _request_drain
+
+    def _on_signal(signum, _frame):
+        _request_drain(f"Signal {signum}")
 
     import signal
     for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):

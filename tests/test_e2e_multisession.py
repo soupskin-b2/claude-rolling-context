@@ -73,7 +73,7 @@ def main():
     }
     json.dump({"env": dict(old_env)}, open(settings_path, "w"))
 
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ROLLING_CONTEXT_")}
     env.update({"USERPROFILE": home, "HOME": home, "HOMEDRIVE": "", "HOMEPATH": "",
                 "ROLLING_CONTEXT_PORT": str(core), "ROLLING_CONTEXT_MITM_PORT": str(mitm),
                 "ROLLING_CONTEXT_UPSTREAM": f"http://127.0.0.1:{mockp}"})

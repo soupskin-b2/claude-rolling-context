@@ -27,6 +27,8 @@ import select
 import socket
 import ssl
 import threading
+import time
+from urllib.parse import urlsplit
 
 # Hosts intercepted by default; everything else is blind-tunnelled so telemetry,
 # updates and any unrelated TLS pass through untouched. A non-Anthropic upstream
@@ -66,13 +68,33 @@ def ensure_ca(ca_dir: str, extra_hosts=()):
                     covered = {ln.strip().lower() for ln in f if ln.strip()}
             except OSError:
                 covered = set()
-        if not have_ca or not os.path.exists(leaf_path) or not hosts <= covered:
+        if (not have_ca or not os.path.exists(leaf_path) or not hosts <= covered
+                or not _has_key_ids(ca_cert_path, leaf_path)):
             _generate(ca_cert_path, ca_key_path, leaf_path, hosts_path, sorted(hosts),
                       reuse_ca=have_ca)
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(leaf_path)
     return ca_cert_path, ctx, hosts
+
+
+def _has_key_ids(ca_cert_path: str, leaf_path: str) -> bool:
+    """Whether the CA has a Subject Key Identifier and the leaf an Authority
+    Key Identifier. Certificates made before these were added fail Python
+    3.13+'s strict verification; they are re-issued (same CA key) when not."""
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import ExtensionOID
+
+        def has(path, oid):
+            with open(path, "rb") as f:
+                cert = x509.load_pem_x509_certificate(f.read())
+            return any(e.oid == oid for e in cert.extensions)
+
+        return (has(ca_cert_path, ExtensionOID.SUBJECT_KEY_IDENTIFIER)
+                and has(leaf_path, ExtensionOID.AUTHORITY_KEY_IDENTIFIER))
+    except Exception:
+        return True   # unreadable: leave it to the load below to report
 
 
 def _generate(ca_cert_path: str, ca_key_path: str, leaf_path: str,
@@ -91,13 +113,22 @@ def _generate(ca_cert_path: str, ca_key_path: str, leaf_path: str,
     now = datetime.datetime.now(datetime.timezone.utc)
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Claude Local Proxy CA")])
 
+    reissue_ca = False
     if reuse_ca:
-        # Only the leaf needs to change (new host added) — keep the CA so the CA
-        # already trusted via NODE_EXTRA_CA_CERTS stays valid.
+        # Only the leaf needs to change (new host added) — keep the CA key so
+        # the CA already trusted via NODE_EXTRA_CA_CERTS stays valid.
         with open(ca_key_path, "rb") as f:
             ca_key = serialization.load_pem_private_key(f.read(), password=None)
+        # A CA made before the Subject Key Identifier was added: re-issue it
+        # with the same key and name. Sessions that loaded the old copy still
+        # verify leaves against it; new ones get one strict mode accepts.
+        with open(ca_cert_path, "rb") as f:
+            old_ca = x509.load_pem_x509_certificate(f.read())
+        reissue_ca = not any(e.oid == x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER
+                             for e in old_ca.extensions)
     else:
         ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    if not reuse_ca or reissue_ca:
         ca_cert = (
             x509.CertificateBuilder()
             .subject_name(ca_name).issuer_name(ca_name)
@@ -111,6 +142,10 @@ def _generate(ca_cert_path: str, ca_key_path: str, leaf_path: str,
                                          content_commitment=False, data_encipherment=False,
                                          key_agreement=False, encipher_only=False,
                                          decipher_only=False), critical=True)
+            # Python 3.13+ verifies in strict X.509 mode by default, which
+            # rejects a CA without a Subject Key Identifier.
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+                           critical=False)
             .sign(ca_key, hashes.SHA256())
         )
         _atomic_write(ca_cert_path, ca_cert.public_bytes(serialization.Encoding.PEM))
@@ -130,6 +165,12 @@ def _generate(ca_cert_path: str, ca_key_path: str, leaf_path: str,
         .not_valid_after(now + datetime.timedelta(days=3650))
         .add_extension(x509.SubjectAlternativeName(sans), critical=False)
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        # Strict mode (Python 3.13+) also wants these on the leaf: without the
+        # Authority Key Identifier it fails "Missing Authority Key Identifier".
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                       critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()),
+                       critical=False)
         .sign(ca_key, hashes.SHA256())
     )
     _atomic_write(leaf_path,
@@ -143,13 +184,10 @@ def _generate(ca_cert_path: str, ca_key_path: str, leaf_path: str,
 # --------------------------------------------------------------------------
 # CONNECT proxy
 # --------------------------------------------------------------------------
-def _read_connect_line(sock: socket.socket):
-    """Read the CONNECT request line + headers.
+def _read_head(sock: socket.socket):
+    """Read a request line + headers: ``(bytes read, None)`` or ``(None, reason)``.
 
-    Returns ``(host, port)`` on success, or ``(None, reason)`` — a short human
-    reason the front-end can log — so a connection we close before a usable
-    CONNECT is never dropped silently (issue #12: a running session flipped onto
-    a transport it could not satisfy hit this path and the proxy logged nothing).
+    The bytes may run past the blank line (a body the client sent at once).
     """
     tls_hello = ("client spoke TLS directly to the proxy port "
                  "(HTTPS_PROXY must be an http:// URL, not https://)")
@@ -172,6 +210,24 @@ def _read_connect_line(sock: socket.socket):
             return None, tls_hello
         if len(buf) > 65536:
             return None, "request headers exceeded 64 KiB without a CONNECT"
+    return buf, None
+
+
+def _read_connect_line(sock: socket.socket):
+    """Read the CONNECT request line + headers.
+
+    Returns ``(host, port)`` on success, or ``(None, reason)`` — a short human
+    reason the front-end can log — so a connection we close before a usable
+    CONNECT is never dropped silently (issue #12: a running session flipped onto
+    a transport it could not satisfy hit this path and the proxy logged nothing).
+    """
+    buf, reason = _read_head(sock)
+    if buf is None:
+        return None, reason
+    return _parse_connect(buf)
+
+
+def _parse_connect(buf: bytes):
     first = buf.split(b"\r\n", 1)[0].decode("latin1", "replace")
     parts = first.split(" ")
     if len(parts) < 2 or parts[0].upper() != "CONNECT":
@@ -179,6 +235,46 @@ def _read_connect_line(sock: socket.socket):
     hostport = parts[1]
     host, _, port = hostport.partition(":")
     return host, int(port or "443")
+
+
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _plain_local(buf: bytes, local_ports):
+    """``(port, head)`` for a plain-HTTP request to one of our own ports.
+
+    A client that sends every request through HTTPS_PROXY - Claude Code's own
+    plugin fetch does, http:// included - asks this port for the proxy's
+    /health as ``GET http://127.0.0.1:5588/health``, not as a CONNECT. Relayed
+    to that port with the request line in origin form; anything else - another
+    host, another port - is still refused, so this is no open proxy.
+    """
+    first, sep, rest = buf.partition(b"\r\n")
+    parts = first.split(b" ")
+    if len(parts) != 3 or not parts[1].lower().startswith(b"http://"):
+        return None
+    u = urlsplit(parts[1].decode("latin1", "replace"))
+    try:
+        port = u.port
+    except ValueError:
+        return None
+    if (u.hostname or "").lower() not in _LOOPBACK or port not in local_ports:
+        return None
+    target = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    return port, b" ".join([parts[0], target.encode("latin1"), parts[2]]) + sep + rest
+
+
+def _relay_local(client: socket.socket, port: int, head: bytes) -> None:
+    try:
+        upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
+        upstream.sendall(head)
+    except OSError:
+        try:
+            client.close()
+        except OSError:
+            pass
+        return
+    _pipe(client, upstream)
 
 
 def _blind_tunnel(client: socket.socket, host: str, port: int) -> None:
@@ -190,6 +286,10 @@ def _blind_tunnel(client: socket.socket, host: str, port: int) -> None:
         except OSError:
             pass
         return
+    _pipe(client, upstream)
+
+
+def _pipe(client: socket.socket, upstream: socket.socket) -> None:
     socks = [client, upstream]
     try:
         while True:
@@ -236,12 +336,14 @@ def bind_listener(host: str, port: int) -> socket.socket:
 
 
 def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1",
-          extra_hosts=(), listener=None):
+          extra_hosts=(), listener=None, local_ports=()):
     """Start the CONNECT front-end. Blocks; run in a thread.
 
     on_terminated(tls_sock, client_addr, sni_host) is called with a decrypted,
     server-side TLS socket for each intercepted connection. It owns the socket.
     extra_hosts adds non-default hostnames to intercept (e.g. a custom gateway).
+    local_ports are this proxy's own loopback ports, which a plain-HTTP
+    request through this front-end is relayed to (see _plain_local).
     """
     try:
         ca_cert_path, ctx, hosts = ensure_ca(ca_dir, extra_hosts)
@@ -272,7 +374,15 @@ def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1"
     def handle(client, addr):
         peer = f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) and len(addr) >= 2 else str(addr)
         try:
-            thost, tport = _read_connect_line(client)
+            buf, reason = _read_head(client)
+            if buf is not None:
+                local = _plain_local(buf, local_ports)
+                if local is not None:
+                    _relay_local(client, *local)
+                    return
+                thost, tport = _parse_connect(buf)
+            else:
+                thost, tport = None, reason
             if thost is None:
                 # tport carries the reason string. Never close silently — a
                 # stranded session (issue #12) reaches exactly here.
@@ -323,6 +433,13 @@ def close_listener():
     global _listener
     srv, _listener = _listener, None
     if srv is not None:
+        # On Linux, close() alone does not wake the thread blocked in
+        # accept(), and the port stays bound (and accepting) until it does:
+        # a successor's bind fails. shutdown() wakes it and lets go of the port.
+        try:
+            srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             srv.close()
         except OSError:
@@ -330,13 +447,23 @@ def close_listener():
 
 
 def start_in_thread(mitm_port: int, ca_dir: str, on_terminated, log=None,
-                    extra_hosts=()) -> threading.Thread:
+                    extra_hosts=(), local_ports=()) -> threading.Thread:
     # Bind here, in the caller, so a port that is already taken raises where
     # it can be acted on instead of dying silently inside the thread.
-    listener = bind_listener("127.0.0.1", mitm_port)
+    # A successor (started right after asking the running proxy to hand
+    # over) may find the port still held for a moment while it lets go.
+    bind_until = time.time() + (10 if os.environ.get("ROLLING_CONTEXT_SUCCESSOR") else 0)
+    while True:
+        try:
+            listener = bind_listener("127.0.0.1", mitm_port)
+            break
+        except OSError:
+            if time.time() >= bind_until:
+                raise
+            time.sleep(0.2)
     t = threading.Thread(target=serve,
                          args=(mitm_port, ca_dir, on_terminated, log, "127.0.0.1", extra_hosts,
-                               listener),
+                               listener, tuple(local_ports)),
                          daemon=True)
     t.start()
     return t

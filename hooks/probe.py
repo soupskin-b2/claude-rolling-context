@@ -47,6 +47,13 @@ time):
                                established client connections instead) —
                                wait, and if it never goes idle, defer the
                                upgrade to a later session start
+
+    python probe.py [port] [timeout_seconds] drain
+
+asks the serving proxy to hand over (POST /drain): it stops listening at
+once, so a successor can bind, and finishes its open requests before it
+exits. Prints "draining" when it accepted, "unsupported" otherwise (a proxy
+older than the endpoint, or nothing there) - then the hook kills it instead.
 """
 import json
 import os
@@ -168,6 +175,18 @@ def decide(body, ours, port):
     return f"older {running} busy {n} sockets"
 
 
+def drain(port, timeout=2.0):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/drain", data=b"", method="POST",
+                                 headers={"X-Rolling-Context": "drain"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return "unsupported"
+    return "draining" if isinstance(body, dict) and body.get("draining") else "unsupported"
+
+
 if __name__ == "__main__":
     _port = sys.argv[1] if len(sys.argv) > 1 else "5588"
     try:
@@ -175,6 +194,9 @@ if __name__ == "__main__":
     except (IndexError, ValueError):
         _timeout = 2.0
     _mode = sys.argv[3] if len(sys.argv) > 3 else ""
+    if _mode == "drain":
+        print(drain(_port, _timeout))
+        sys.exit(0)
     _body = health(_port, _timeout)
     if _mode == "pid":
         print((_body or {}).get("pid") or "")

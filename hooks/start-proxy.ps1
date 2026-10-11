@@ -134,6 +134,9 @@ function Stop-ProxyPid($processId, $source) {
     if (Test-IsOurProxy $processId) {
         Log "Stopping proxy PID $processId ($source)"
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        # Gone before the PID-file check, so a PID that is still exiting is
+        # not reported as someone else's.
+        Wait-Process -Id $processId -Timeout 3 -ErrorAction SilentlyContinue
     } else {
         Log "PID $processId ($source) is alive but is not our proxy — recycled PID, leaving that process alone"
     }
@@ -152,8 +155,27 @@ function Clear-RecordedProxy([switch]$Serving) {
     Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
 }
 
-function Replace-RunningProxy {
-    Clear-RecordedProxy -Serving
+function Request-Drain {
+    # Ask the running proxy to hand over: it stops listening now and finishes
+    # its open requests on its own. Windows has no SIGTERM, so without this a
+    # restart is a kill that cuts every open stream - the desktop app's
+    # session streams included.
+    try { [string](& python $Probe $Port "2" "drain" | Select-Object -First 1) -eq "draining" } catch { $false }
+}
+
+function Replace-RunningProxy([switch]$WaitForIdle) {
+    if (Request-Drain) {
+        Log "Proxy is handing over: it stopped listening and finishes its open requests on its own"
+        # It may hold the ports a moment longer while it saves the store: tell
+        # the new proxy to keep trying the bind rather than exit.
+        $env:ROLLING_CONTEXT_SUCCESSOR = "1"
+        Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $VerFile -Force -ErrorAction SilentlyContinue
+    } else {
+        # Too old to hand over: a kill, after a short wait for idle.
+        if ($WaitForIdle) { $null = Wait-UntilIdle 6 }
+        Clear-RecordedProxy -Serving
+    }
     # The old proxy owns the port until it actually exits. Starting on top of
     # it would just lose the bind and leave the old version serving while the
     # log claimed a restart.
@@ -176,14 +198,14 @@ function Replace-RunningProxy {
 # cut every session's in-flight stream (nestor-plugins issue #1). Policy now:
 # never downgrade, and only replace an older proxy when nothing is in flight.
 # ROLLING_CONTEXT_FORCE_RESTART=1 (the /rolling-context:restart command)
-# restarts regardless of version, still waiting briefly for idle.
+# restarts regardless of version: a proxy that can hand over (POST /drain)
+# finishes its open requests itself; an older one gets a short wait for idle.
 $Force = [bool]$env:ROLLING_CONTEXT_FORCE_RESTART
 $decision = Get-Decision 2
 if ($decision -eq "same") {
     if ($Force) {
-        $decision = Wait-UntilIdle 6
-        Log "Forced restart of v$CurrentVersion ($decision)"
-        Replace-RunningProxy
+        Log "Forced restart of v$CurrentVersion"
+        Replace-RunningProxy -WaitForIdle
     } else {
         Log "Proxy already running and healthy on :$Port (v$CurrentVersion)"
         exit 0
@@ -191,9 +213,8 @@ if ($decision -eq "same") {
 } elseif ($decision -like "newer *") {
     $running = $decision.Substring(6)
     if ($Force) {
-        $decision = Wait-UntilIdle 6
         Log "Forced restart: replacing v$running with v$CurrentVersion"
-        Replace-RunningProxy
+        Replace-RunningProxy -WaitForIdle
     } else {
         Log "Proxy v$running on :$Port is newer than this plugin (v$CurrentVersion) — leaving it alone, never downgrading. This session uses it as is."
         exit 0
@@ -208,7 +229,7 @@ if ($decision -eq "same") {
     }
     if ($decision -like "older *") {
         if ($parts[2] -eq "busy" -and -not $Force) {
-            Log "Deferring upgrade: proxy v$running still has $($parts[3]) in flight ($($parts[4])). This session uses it as is; the upgrade to v$CurrentVersion happens at the next session start that finds it idle, or now via /rolling-context:restart."
+            Log "Deferring upgrade: proxy v$running still has $($parts[3]) in flight ($($parts[4])). This session uses it as is; the upgrade to v$CurrentVersion happens at the next session start that finds it idle, or now via /roll restart."
             exit 0
         }
         $how = if ($parts[2]) { $parts[2] } else { "idle" }
