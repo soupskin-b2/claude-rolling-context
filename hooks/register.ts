@@ -2,11 +2,11 @@
 //
 // The plugin's commands/*.md are prompt templates: Claude has to read one,
 // run switch.py through Bash and echo the result, and while it is mid-turn
-// they wait for the turn to end. Here /rc runs switch.py itself, at once,
+// they wait for the turn to end. Here /roll runs switch.py itself, at once,
 // even mid-turn (`immediate`), and prints its output as the command's own.
 // The .md commands stay as the fallback where mods do not load; where they
 // do, this module answers them too (still no Claude turn) and hides them
-// from the menu so /rc is the one listed.
+// from the menu so /roll is the one listed.
 //
 // The status line polls the proxy's /health for this session's state.
 import type { EngineInterface, Register } from 'claude-code'
@@ -70,7 +70,7 @@ async function health($: EngineInterface, sessionId: string): Promise<Health | u
 }
 
 function statusText(h: Health | undefined) {
-  if (!h) return 'proxy not running (it starts with the next session, or /rc restart)'
+  if (!h) return 'proxy not running (it starts with the next session, or /roll restart)'
   const s = h.session
   const on = s ? s.enabled : h.enabled !== false
   const state = on
@@ -93,6 +93,8 @@ const clean = (text: string) =>
 
 // Set from the options in register; /config changes reload the module.
 let showStatus = true
+// Whether /roll was registered: the .md commands are hidden only then.
+let rollRegistered = false
 
 async function refreshStatus($: EngineInterface) {
   if (!showStatus) return
@@ -104,7 +106,7 @@ async function run($: EngineInterface, args: string): Promise<string> {
   const action = (words.find(w => !w.startsWith('-')) ?? 'status').toLowerCase()
   const flags = words.filter(w => w.startsWith('-'))
   if (!(ACTIONS as readonly string[]).includes(action)) {
-    return `Unknown action "${action}". Usage: /rc [status|on|off|restart] [--global]`
+    return `Unknown action "${action}". Usage: /roll [status|on|off|restart] [--global]`
   }
   const sessionId = await $.session.id()
   const root = $.plugin.root
@@ -163,30 +165,37 @@ export const register: Register = (on, options) => {
     } else {
       $.ui.status(undefined)
     }
-    // Last: a refused name throws, and nothing after it would run.
-    await $.command.register({
-      name: 'rc',
-      description: 'rolling-context: status, or turn it on/off for this session (--global for all), or restart the proxy',
-      argumentHint: '[status|on|off|restart] [--global]',
-      immediate: true,
-    })
+    // A name another command already holds (a built-in or its alias, as /rc
+    // is /remote-control's) is refused with a throw. Then the plugin's own
+    // /rolling-context:* commands stay listed, and say so, rather than leave
+    // nothing in the menu.
+    try {
+      await $.command.register({
+        name: 'roll',
+        description: 'rolling-context: status, or turn it on/off for this session (--global for all), or restart the proxy',
+        argumentHint: '[status|on|off|restart] [--global]',
+        immediate: true,
+      })
+      rollRegistered = true
+    } catch (err) {
+      rollRegistered = false
+      $.ui.log(`/roll is unavailable (${String(err)}); use /rolling-context:status, :on, :off and :restart instead`)
+    }
     return next(e)
   })
 
-  on('command.run', { command: 'rc' }, async ($, e) => ({ text: await run($, e.args) }))
+  on('command.run', { command: 'roll' }, async ($, e) => ({ text: await run($, e.args) }))
     .catch(failed)
 
   // The plugin's own /rolling-context:<action> commands: answered here, so
-  // no Claude turn, and kept out of the menu in favour of /rc.
+  // no Claude turn, and kept out of the menu in favour of /roll.
   for (const name of LEGACY) {
     const action = name.split(':')[1]
     on('command.run', { command: name }, async ($, e) => ({
       text: await run($, `${action} ${e.args}`),
     })).catch(failed)
-    on('command.describe', { command: name }, async ($, e, next) => ({
-      ...(await next(e)),
-      isHidden: true,
-    }))
+    on('command.describe', { command: name }, async ($, e, next) =>
+      rollRegistered ? { ...(await next(e)), isHidden: true } : next(e))
   }
 
   // A turn may have triggered a compression; show it without waiting 30 s.

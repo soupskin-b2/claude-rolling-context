@@ -8,7 +8,7 @@
     {
       "name": "rolling-context",
       "source": "./",
-      "description": "Fork of NodeNestor/claude-rolling-context: message-threads support, /rc without a Claude turn, /config options and compression retention."
+      "description": "Fork of NodeNestor/claude-rolling-context: message-threads support, /roll without a Claude turn, /config options and compression retention."
     }
   ]
 }

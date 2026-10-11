@@ -599,7 +599,7 @@ def subagent_inheritance(root):
 
 
 def session_files(root):
-    """/rc (and /rolling-context:on|off run inside Claude Code) record the
+    """/roll (and /rolling-context:on|off run inside Claude Code) record the
     session's choice in a state file keyed by its session id, instead of a
     marker. Same reach as the marker had: the session's subagents follow it,
     other sessions do not, and it wins over a stale marker in the transcript.

@@ -37,10 +37,10 @@ function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string) {
   return { runs, statuses }
 }
 
-describe('/rc', () => {
+describe('/roll', () => {
   test('off runs switch.py for this session and prints its output, minus the marker', async ($, on) => {
     const w = world(on, 'Linux', '<<rolling-context:session-off>>\nrolling-context is now OFF')
-    const { text } = await $.command.run({ command: 'rc', args: 'off' })
+    const { text } = await $.command.run({ command: 'roll', args: 'off' })
     expect(text).toBe('rolling-context is now OFF')
     const run = w.runs.at(-1)!
     expect(run.argv[0]).toBe('python3')
@@ -51,7 +51,7 @@ describe('/rc', () => {
 
   test('uses python on Windows and passes --global through', async ($, on) => {
     const w = world(on, 'Windows_NT', 'rolling-context is now OFF on this machine')
-    await $.command.run({ command: 'rc', args: 'off --global' })
+    await $.command.run({ command: 'roll', args: 'off --global' })
     const run = w.runs.at(-1)!
     expect(run.argv[0]).toBe('python')
     expect(run.argv.slice(2)).toEqual(['off', '--global', '--session', SESSION])
@@ -59,14 +59,14 @@ describe('/rc', () => {
 
   test('an unknown action says how to use it, without running anything', async ($, on) => {
     const w = world(on, 'Linux', '')
-    const { text } = await $.command.run({ command: 'rc', args: 'sideways' })
-    expect(text).toMatch(/Usage: \/rc/)
+    const { text } = await $.command.run({ command: 'roll', args: 'sideways' })
+    expect(text).toMatch(/Usage: \/roll/)
     expect(w.runs.length).toBe(0)
   })
 
   test('the status line shows this session\'s state after a toggle', async ($, on) => {
     const w = world(on, 'Linux', 'ok')
-    await $.command.run({ command: 'rc', args: 'off' })
+    await $.command.run({ command: 'roll', args: 'off' })
     expect(w.statuses.at(-1)).toBe('off for this session · 4.7M tokens saved · 40 stored')
   })
 })
@@ -76,4 +76,31 @@ test('the plugin\'s own /rolling-context:off is answered without a Claude turn',
   const { text } = await $.command.run({ command: 'rolling-context:off', args: '' })
   expect(text).toBe('rolling-context is now OFF')
   expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['off', '--session', SESSION])
+})
+
+describe('registration', () => {
+  // What the menu shows for the plugin's own /rolling-context:status.
+  async function legacyHidden($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
+    on('command.describe', async ($, e) => ({ description: e.description, isHidden: e.isHidden }))
+    on('ui.log', async () => ({ value: undefined }))
+    on('session.start', async ($, e) => e)
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    const shown = await $.command.describe({
+      command: 'rolling-context:status', description: 'status', isHidden: false,
+      immediate: false, provider: { plugin: 'rolling-context', tier: 'user' },
+    })
+    return shown.isHidden
+  }
+
+  test('/roll registers, and the .md commands are hidden in its favour', async ($, on) => {
+    world(on, 'Linux', '')
+    on('command.register', async ($, e) => ({ value: { command: e.name } }))
+    expect(await legacyHidden($, on)).toBe(true)
+  })
+
+  test('if /roll is refused (a taken name), the .md commands stay listed', async ($, on) => {
+    world(on, 'Linux', '')
+    on('command.register', async () => ({ deny: '"/roll" refused: it is taken' }))
+    expect(await legacyHidden($, on)).toBe(false)
+  })
 })

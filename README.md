@@ -227,17 +227,17 @@ optimization pass where the model should see everything. Compression is not
 what you want there.
 
 ```
-/rc off            # this conversation only, other sessions unaffected
-/rc on             # back on
+/roll off            # this conversation only, other sessions unaffected
+/roll on             # back on
 
-/rc off --global   # every session on this machine
-/rc on --global
+/roll off --global   # every session on this machine
+/roll on --global
 
-/rc                # status: this session, machine-wide, and the /config values
-/rc restart        # restart the proxy now
+/roll                # status: this session, machine-wide, and the /config values
+/roll restart        # restart the proxy now
 ```
 
-`/rc` runs at once, **even while Claude is mid-turn**, and never starts a
+`/roll` runs at once, **even while Claude is mid-turn**, and never starts a
 Claude turn: the plugin's mod runs the switch itself and prints the result.
 A status line under the prompt shows whether this session is compressing and
 what it has saved (turn it off in `/config`).
@@ -245,7 +245,7 @@ what it has saved (turn it off in `/config`).
 The older `/rolling-context:status|on|off|restart` commands still work. Where
 mods load (the CLI and the desktop app's Code tab, Claude Code 2.1.287+), the
 mod answers them too, without a Claude turn, and hides them from the menu in
-favour of `/rc`. Elsewhere they are prompt templates Claude runs for you.
+favour of `/roll`. Elsewhere they are prompt templates Claude runs for you.
 
 Both scopes apply from the **next request** — no Claude Code restart, no proxy
 restart. Machine-wide off wins over a session that opted in.
@@ -265,14 +265,14 @@ session, flip the default in `~/.claude-rolling-context/config.json`:
 { "enabled": false }
 ```
 
-Sessions that have not run `/rc off` or `/rc on` follow this;
+Sessions that have not run `/roll off` or `/roll on` follow this;
 an explicit toggle in a session always wins over it. A missing or malformed
 config falls back to on, so a typo can never silently disable your install.
-`/rc` prints the current default.
+`/roll` prints the current default.
 
 ### Subagents follow the session that spawned them
 
-`/rc off` covers the subagents your session launches, so a planning session
+`/roll off` covers the subagents your session launches, so a planning session
 where agents explore the repo keeps full context everywhere — not just in the
 main thread.
 
@@ -410,7 +410,7 @@ proxy to answer before it exits, and says which of these happened:
 | `proxy did not answer on :5588 within ~8s` | It failed to start — see `~/.claude/rolling-context-proxy.log`. |
 | `Proxy vX is newer than this plugin` | A session on a newer plugin version already upgraded it. Left alone; never downgraded. |
 | `waiting for it to go idle before upgrading` | An older proxy has requests in flight; the hook waits up to ~6s. |
-| `Deferring upgrade: proxy vX still has N in flight` | It stayed busy. This session uses the old proxy; the upgrade happens at a later idle session start, or now via `/rc restart`. |
+| `Deferring upgrade: proxy vX still has N in flight` | It stayed busy. This session uses the old proxy; the upgrade happens at a later idle session start, or now via `/roll restart`. |
 
 ### Upgrades never cut a running stream
 
@@ -430,7 +430,7 @@ log). Since v1.13.2:
   field are judged by their established client sockets instead.
 - **Drain on SIGTERM.** The proxy stops accepting, finishes what is in flight
   (up to `ROLLING_CONTEXT_DRAIN_SECONDS`, default 20), then exits.
-- **`/rc restart`** (or `/rolling-context:restart`) forces a restart when you want the new version
+- **`/roll restart`** (or `/rolling-context:restart`) forces a restart when you want the new version
   now; it still waits briefly for in-flight requests.
 
 Sessions still running a pre-1.13.2 plugin keep the old "restart on any

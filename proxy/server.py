@@ -1081,7 +1081,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "cache_integrity": dict(_cache_stats),
         }
         if session_id:
-            # What this session's next request would do, for /rc and the
+            # What this session's next request would do, for /roll and the
             # status line: same precedence as _handle_messages.
             if switch.is_disabled():
                 on, why = False, "machine-wide"
@@ -1160,7 +1160,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
 
         # Precedence: env kill-switch, then an explicit machine-wide off, then
-        # this session's own setting (its state file, written by /rc or
+        # this session's own setting (its state file, written by /roll or
         # /rolling-context:on|off, before any legacy marker), then the
         # configured default.
         if switch.is_disabled():

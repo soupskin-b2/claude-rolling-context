@@ -325,10 +325,10 @@ def _set(disabled):
 
 
 def _cmd(action, is_global=False):
-    """How to spell a command in a hint: the mod's /rc, or the plugin's own."""
+    """How to spell a command in a hint: the mod's /roll, or the plugin's own."""
     flag = " --global" if is_global else ""
     if os.environ.get("ROLLING_CONTEXT_VIA") == "mod":
-        return f"/rc {action}{flag}"
+        return f"/roll {action}{flag}"
     return f"/rolling-context:{action}{flag}"
 
 
