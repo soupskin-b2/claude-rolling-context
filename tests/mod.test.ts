@@ -8,19 +8,21 @@ const SESSION = 'sess-1234'
 
 type Run = { argv: readonly string[]; env: Record<string, string> }
 
-function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string) {
+// hangFetch: /health never answers, as a fetch through a proxy that cannot
+// relay it did.
+function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false) {
   const runs: Run[] = []
   const statuses: (string | undefined)[] = []
   mock.env(on, os === 'Windows_NT'
     ? { OS: 'Windows_NT', USERPROFILE: 'C:/Users/u' }
     : { HOME: '/home/u' })
-  mock.clock(on)
+  const clock = mock.clock(on)
   on('session.id', async () => ({ value: SESSION }))
   on('process.run', async ($, e) => {
     runs.push({ argv: e.argv, env: { ...(e.init?.env ?? {}) } })
     return { value: { exitCode: 0, stdout, stderr: '' } }
   })
-  on('http.fetch', async () => ({
+  on('http.fetch', async () => hangFetch ? new Promise<never>(() => {}) : ({
     value: {
       status: 200, ok: true, headers: {},
       text: JSON.stringify({
@@ -34,7 +36,7 @@ function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string) {
     statuses.push(e.text)
     return { value: undefined }
   })
-  return { runs, statuses }
+  return { runs, statuses, clock }
 }
 
 describe('/roll', () => {
@@ -62,6 +64,20 @@ describe('/roll', () => {
     const { text } = await $.command.run({ command: 'roll', args: 'sideways' })
     expect(text).toMatch(/Usage: \/roll/)
     expect(w.runs.length).toBe(0)
+  })
+
+  test('a /health fetch that never answers does not hold the command open', async ($, on) => {
+    const { clock } = world(on, 'Linux', 'rolling-context is now OFF', true)
+    let done = false
+    const pending = $.command.run({ command: 'roll', args: 'off' }).then(r => {
+      done = true
+      return r
+    })
+    await clock.advance(1_000)
+    expect(done).toBe(false)
+    await clock.advance(1_500)
+    expect(done).toBe(true)
+    expect((await pending).text).toBe('rolling-context is now OFF')
   })
 
   test('the status line shows this session\'s state after a toggle', async ($, on) => {

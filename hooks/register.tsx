@@ -72,13 +72,19 @@ async function runPython($: EngineInterface, args: string[], env: Record<string,
   throw lastError
 }
 
+// $.http.fetch takes no timeout, and a fetch that never settles (the engine
+// sends it through HTTPS_PROXY, to a proxy that may be mid-restart or too old
+// to relay it) held every /roll command open until the user stopped it.
+const HEALTH_TIMEOUT_MS = 2_000
+
 async function health($: EngineInterface, sessionId: string): Promise<Health | undefined> {
   const port = (await $.env.get('ROLLING_CONTEXT_PORT')) || '5588'
   try {
-    const r = await $.http.fetch(
-      `http://127.0.0.1:${port}/health?session=${encodeURIComponent(sessionId)}`,
-    )
-    if (!r.ok) return undefined
+    const r = await Promise.race([
+      $.http.fetch(`http://127.0.0.1:${port}/health?session=${encodeURIComponent(sessionId)}`),
+      $.clock.sleep(HEALTH_TIMEOUT_MS).then(() => undefined),
+    ])
+    if (!r || !r.ok) return undefined
     const body = JSON.parse(r.text) as Health
     return body.service === 'rolling-context' ? body : undefined
   } catch {
