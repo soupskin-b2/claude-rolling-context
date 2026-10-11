@@ -13,6 +13,7 @@ Pure stdlib — no external dependencies needed.
 """
 
 import hashlib
+import itertools
 import json
 import os
 from collections import OrderedDict
@@ -21,6 +22,7 @@ import logging
 import logging.handlers
 import threading
 import time
+import socket
 import ssl
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -367,6 +369,7 @@ class CompressionStore:
     def __init__(self):
         self._lock = threading.Lock()
         self._compressions = []  # list of compression entries
+        self._eids = itertools.count(1)
 
     def find_match(self, msg_hashes: list, messages: list = None):
         """Find a compression whose hash chain appears in msg_hashes.
@@ -428,6 +431,7 @@ class CompressionStore:
 
     def add(self) -> dict:
         entry = {
+            "eid": next(self._eids),  # identity for thread chains (never reused)
             "original_hashes": [],   # hashes of original messages we replaced
             "prefix": None,          # compressed replacement messages
             "pending": None,         # pending compression result
@@ -441,6 +445,8 @@ class CompressionStore:
     def remove(self, entry: dict):
         with self._lock:
             self._compressions = [e for e in self._compressions if e is not entry]
+        if entry.get("prefix") is not None:
+            _persist_soon()
 
     @property
     def compressions(self):
@@ -566,6 +572,214 @@ def _cooldown_remaining(owner: str) -> float:
 _last_injection_ts = 0.0
 
 
+# --- message threads (beta message-threads-2026-08-12) ----------------------
+# Claude Code sends the full history once, with thread {"type": "create"}, and
+# every later turn as thread {"type": "continue", "previous_message_id": ...}
+# carrying only the new messages: the server holds the rest. A proxy that
+# compresses what it can see cannot act on a continue, so before this the only
+# compressions were the rare ones that landed on a session start or resume.
+#
+# The way back to the full history is the client's own: a continue answered
+# with 404 thread_not_found is resent at once as a create with the whole
+# transcript (Claude Code: "replay_not_found"), with no lasting penalty. So the
+# proxy asks for it exactly when it has a use for it:
+#   - "compress": a continue reported more than the trigger, and nothing is
+#     compressing this conversation — the create feeds the normal compression.
+#   - "inject":   a compression for this conversation is ready and this chain
+#     has not carried it yet — the create gets the summary injected, and the
+#     server starts a new, small thread from it. Later continues extend that.
+# Each chain (one server-side thread, followed through its response message
+# ids) remembers which compression it was created with.
+_THREAD_NOT_FOUND = json.dumps({
+    "type": "error",
+    "error": {
+        "type": "not_found_error",
+        "message": ("thread_not_found: rolling-context is rebasing this "
+                    "conversation onto its compressed history; resend as create"),
+        "details": {"error_code": "thread_not_found"},
+    },
+}).encode()
+
+_thread_chains = OrderedDict()      # response message id -> chain dict
+_thread_forced = {}                 # conversation key -> time of last "compress" force
+_threads_lock = threading.Lock()
+
+
+def _new_chain(convo_key, injected_eid=None) -> dict:
+    return {"convo_key": convo_key, "injected": injected_eid, "over": False}
+
+
+def _chain_for(message_id):
+    with _threads_lock:
+        return _thread_chains.get(message_id) if message_id else None
+
+
+def _remember_chain(message_id, chain: dict):
+    if not message_id:
+        return
+    with _threads_lock:
+        _thread_chains[message_id] = chain
+        while len(_thread_chains) > 4096:
+            _thread_chains.popitem(last=False)
+    _persist_soon()
+
+
+# ---------------------------------------------------------------------------
+# Persistence. Ready compressions and thread chains live in memory, so a proxy
+# restart used to throw them all away: every long conversation then went
+# upstream once at full size (its whole local transcript, nothing to swap in)
+# and paid a fresh cache write plus a from-scratch compaction. They are now
+# mirrored to disk and reloaded on start. Writes are debounced and atomic —
+# the restart hook force-kills the process, so there is no exit hook to rely on.
+# ---------------------------------------------------------------------------
+
+# One file per listen port: a second proxy (a test run, a custom-endpoint
+# instance) must never load or overwrite the main proxy's summaries.
+STORE_PATH = os.environ.get("ROLLING_CONTEXT_STORE_PATH") or os.path.join(
+    switch.flag_dir(), f"store-{LISTEN_PORT}.json")
+_STORE_VERSION = 1
+_STORE_MAX_ENTRIES = 64           # newest ready compressions kept on disk
+_STORE_MAX_CHAINS = 1024          # newest thread anchors kept on disk
+_STORE_MAX_AGE = 14 * 86400       # an anchor or summary older than this is dead
+_persist_dirty = threading.Event()
+
+
+def _persist_soon():
+    _persist_dirty.set()
+
+
+def _snapshot_state() -> dict:
+    with store._lock:
+        ready = [e for e in store._compressions if e.get("prefix") is not None]
+    ready = ready[-_STORE_MAX_ENTRIES:]
+    entries = [{
+        "eid": e["eid"],
+        "owner": e.get("owner"),
+        "original_hashes": e["original_hashes"],
+        "prefix": e["prefix"],
+        "rebase_requested": bool(e.get("rebase_requested")),
+        "saved_at": e.setdefault("saved_at", time.time()),
+    } for e in ready]
+    with _threads_lock:
+        items = list(_thread_chains.items())[-_STORE_MAX_CHAINS:]
+    chains, anchors, index = [], {}, {}
+    for mid, chain in items:
+        k = id(chain)
+        if k not in index:
+            index[k] = len(chains)
+            chains.append(dict(chain))
+        anchors[mid] = index[k]
+    return {"version": _STORE_VERSION, "saved_at": time.time(),
+            "entries": entries, "chains": chains, "anchors": anchors}
+
+
+def _write_state():
+    state = _snapshot_state()
+    os.makedirs(os.path.dirname(STORE_PATH), exist_ok=True)
+    tmp = STORE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, separators=(",", ":"))
+    os.replace(tmp, STORE_PATH)
+
+
+def _persist_loop():
+    while True:
+        _persist_dirty.wait()
+        time.sleep(1.0)               # coalesce bursts (promotion + chain + flag)
+        _persist_dirty.clear()
+        try:
+            _write_state()
+        except Exception as e:
+            log.warning(f"[STORE] Could not save {STORE_PATH}: {e}")
+
+
+def _load_state():
+    try:
+        with open(STORE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log.warning(f"[STORE] Ignoring unreadable {STORE_PATH}: {e}")
+        return
+    if state.get("version") != _STORE_VERSION:
+        log.info(f"[STORE] Ignoring {STORE_PATH} (version {state.get('version')})")
+        return
+    now = time.time()
+    max_eid = 0
+    loaded = []
+    for d in state.get("entries", []):
+        if now - d.get("saved_at", 0) > _STORE_MAX_AGE:
+            continue
+        if not d.get("original_hashes") or not d.get("prefix"):
+            continue
+        loaded.append({
+            "eid": d["eid"], "owner": d.get("owner"),
+            "original_hashes": d["original_hashes"], "prefix": d["prefix"],
+            "pending": None, "pending_hashes": None, "thread": None,
+            "rebase_requested": d.get("rebase_requested", False),
+            "saved_at": d["saved_at"],
+        })
+        max_eid = max(max_eid, d["eid"])
+    chains = state.get("chains", [])
+    fresh = now - state.get("saved_at", 0) <= _STORE_MAX_AGE
+    with store._lock:
+        store._compressions[:0] = loaded
+        store._eids = itertools.count(max(max_eid + 1, next(store._eids)))
+    n_anchors = 0
+    if fresh:
+        with _threads_lock:
+            for mid, i in state.get("anchors", {}).items():
+                if 0 <= i < len(chains):
+                    _thread_chains[mid] = chains[i]
+                    n_anchors += 1
+    log.info(f"[STORE] Restored {len(loaded)} compression(s) and {n_anchors} "
+             f"thread anchor(s) from {STORE_PATH}")
+
+
+def _usable_compression(convo_key):
+    """Newest ready compression owned by this conversation, or None."""
+    if not convo_key:
+        return None
+    for entry in reversed(store.compressions):
+        if entry.get("owner") == convo_key and entry.get("prefix") is not None:
+            return entry
+    return None
+
+
+def _thread_rebase_reason(chain: dict):
+    """Why this continue should become a create, or None to let it through."""
+    key = chain["convo_key"]
+    ready = _usable_compression(key)
+    if ready is not None and ready["eid"] != chain["injected"]:
+        # Once per compression: if the create fails to pick it up (history
+        # drifted), forcing again would just loop.
+        if not ready.get("rebase_requested"):
+            ready["rebase_requested"] = True
+            _persist_soon()
+            return "inject"
+    if not chain["over"]:
+        return None
+    if key and any(e.get("owner") == key and e["thread"] is not None
+                   and e["thread"].is_alive() for e in store.compressions):
+        return None
+    if key and _cooldown_remaining(key) > 0:
+        return None
+    # A conversation the proxy has never seen a create for (it restarted) has
+    # no key yet; the chain object stands in until the create gives it one.
+    force_key = key or id(chain)
+    now = time.time()
+    with _threads_lock:
+        if now - _thread_forced.get(force_key, 0.0) < FAILURE_COOLDOWN:
+            return None
+        _thread_forced[force_key] = now
+        if len(_thread_forced) > 512:
+            for k in [k for k, v in _thread_forced.items() if now - v > FAILURE_COOLDOWN]:
+                _thread_forced.pop(k, None)
+    chain["over"] = False
+    return "compress"
+
+
 def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
                                real_token_count: int = None, payload: dict = None):
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
@@ -577,20 +791,18 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
             # Nothing worth compressing — don't leave an empty entry behind
             store.remove(entry)
             return
-        # compressed = [summary, ack] + recent_verbatim
-        # Prefix = ONLY [summary, ack] — verbatim messages come from the
+        # compressed = [summary, (carried system,) ack] + recent_verbatim
+        # Prefix = ONLY the summary part — verbatim messages come from the
         # original request during injection, so including them in the prefix
         # would cause duplication.
-        prefix = compressed[:2]
+        from compressor import prefix_len
+        plen = prefix_len(compressed)
+        prefix = compressed[:plen]
         # Key = the messages that were summarized away (not the verbatim ones).
-        recent_count = len(compressed) - 2  # subtract summary + ack
+        recent_count = len(compressed) - plen
         summarized = messages[:len(messages) - recent_count]
         # Skip old summary prefix if present
-        from compressor import SUMMARY_MARKER
-        start = 0
-        if summarized and isinstance(summarized[0].get("content", ""), str):
-            if SUMMARY_MARKER in summarized[0]["content"]:
-                start = 2
+        start = prefix_len(summarized)
         key_hashes = _hash_messages(summarized[start:])
         entry["pending"] = prefix
         entry["pending_hashes"] = key_hashes
@@ -826,6 +1038,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         messages = payload.get("messages", [])
         is_streaming = payload.get("stream", False)
         model = payload.get("model", "unknown")
+        thread = payload.get("thread") if isinstance(payload.get("thread"), dict) else {}
+        thread_type = thread.get("type")  # "create", "continue", or None (no threads)
 
         # Hash all messages for content-based matching
         msg_hashes = _hash_messages(messages)
@@ -840,6 +1054,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             f"[MSG] model={model} stream={is_streaming} "
             f"messages={len(messages)} chars={msg_chars:,} "
             f"session={session_id[:8] or '(none)'}"
+            + (f" thread={thread_type}" if thread_type else "")
         )
 
         # /rolling-context:off — resolved fresh per request so the toggle is
@@ -885,16 +1100,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 entry["original_hashes"] = entry["pending_hashes"]
                 entry["pending"] = None
                 entry["pending_hashes"] = None
+                _persist_soon()
                 log.info(
                     f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
                     f"replacing {len(entry['original_hashes'])} originals"
                 )
 
+        # A continue carries only the new turn; the history it extends lives on
+        # the server. When the proxy needs that history — to compress it, or to
+        # swap a ready summary in — it answers thread_not_found and Claude Code
+        # resends this same turn as a create with the full transcript.
+        chain = None
+        if thread_type == "continue":
+            prev_id = thread.get("previous_message_id")
+            chain = _chain_for(prev_id)
+            if chain is None:
+                chain = _new_chain(None)
+            reason = None if disabled else _thread_rebase_reason(chain)
+            if reason:
+                log.info(
+                    f"[THREAD] Asking the client to resend {str(prev_id)[:16]}... "
+                    f"as a create with full history ({reason})"
+                )
+                self.send_response(404)
+                self.send_header("content-type", "application/json")
+                self.send_header("x-should-retry", "false")
+                self.send_header("content-length", str(len(_THREAD_NOT_FOUND)))
+                self.end_headers()
+                self.wfile.write(_THREAD_NOT_FOUND)
+                return
+
         # Scan: do any stored compressions match this request's messages?
         # Skipped entirely while off — find_match is also the only caller that
         # prunes no-longer-helpful entries, so not running it keeps the store
-        # exactly as it was.
-        match, match_end = (None, -1) if disabled else store.find_match(msg_hashes, messages)
+        # exactly as it was. Never on a continue: rewriting a partial turn
+        # would corrupt the history the server is holding.
+        match, match_end = ((None, -1) if disabled or thread_type == "continue"
+                            else store.find_match(msg_hashes, messages))
         injected = False
 
         if match and match["prefix"] is not None and match_end > 0:
@@ -946,6 +1188,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # the life of a transcript even after injection rewrites the payload.
         sent_hashes = msg_hashes if not injected else _hash_messages(current_messages)
         convo_key = _conversation_key(session_id, msg_hashes)
+        if chain is None and thread_type == "create":
+            # A new server-side thread. It is built from whatever we send, so
+            # it carries the injected compression (if any) from here on.
+            chain = _new_chain(convo_key, match["eid"] if injected else None)
         cache_expectation = "first"
         with _last_sent_lock:
             prev_sent = _last_sent.get(convo_key)
@@ -1029,6 +1275,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             total_bytes = 0
             total_input = 0
             cache_read = None  # None = usage didn't report a cache split
+            response_id = None  # the next continue names it as previous_message_id
             while True:
                 chunk = resp.read1(8192)
                 if not chunk:
@@ -1059,6 +1306,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
                         # Anthropic native: usage in message_start.message.usage
                         if evt_type == "message_start":
+                            response_id = data.get("message", {}).get("id") or response_id
                             usage = data.get("message", {}).get("usage", {})
                             tokens = (
                                 usage.get("input_tokens", 0)
@@ -1094,6 +1342,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             elif not is_streaming and buffer:
                 try:
                     data = json.loads(buffer)
+                    response_id = data.get("id")
                     usage = data.get("usage", {})
                     total_input = (
                         usage.get("input_tokens", 0)
@@ -1147,6 +1396,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             f"requests at or over the trigger "
                             f"({_stats['injected'] / seen * 100:.0f}%)"
                         )
+
+            if chain is not None and resp.status == 200:
+                _remember_chain(response_id, chain)
+                if (thread_type == "continue" and not disabled
+                        and total_input > TRIGGER_TOKENS):
+                    if not chain["over"]:
+                        log.info(
+                            f"[THREAD] {total_input:,} tokens on a continue "
+                            f"(trigger: {TRIGGER_TOKENS:,}) — the next turn "
+                            f"will fetch the full history to compress it"
+                        )
+                    chain["over"] = True
+                    _persist_soon()
 
             # Trigger compression based on token count. The minimum message
             # count keeps us from "compressing" sessions whose bulk is the
@@ -1237,6 +1499,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 class ThreadedHTTPServer(HTTPServer):
     """Handle each request in a new thread."""
+    # HTTPServer sets SO_REUSEADDR, which on Windows lets a second proxy bind
+    # this port while the first still listens; the two then split requests.
+    # Claim it exclusively there (see mitm_frontend.bind_listener).
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
     def process_request(self, request, client_address):
         t = threading.Thread(target=self._handle, args=(request, client_address))
         t.daemon = True
@@ -1266,8 +1537,15 @@ def main():
     log.info(f"  Compacting via: {SUMMARIZER_BASE_URL}"
              f"{' (third-party — flattened fallback armed)' if NATIVE_FALLBACK else ''}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
+    _load_state()
+    threading.Thread(target=_persist_loop, name="store-saver", daemon=True).start()
 
-    server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+    try:
+        server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)
+    except OSError as e:
+        log.error(f"Port {LISTEN_PORT} is already in use ({e}); another proxy "
+                  f"is serving it. Exiting.")
+        sys.exit(1)
 
     # Start the MITM front-end. Claude Code connects to it via HTTPS_PROXY,
     # believing it is talking to api.anthropic.com; the front-end terminates TLS
@@ -1294,6 +1572,13 @@ def main():
         mitm_frontend.start_in_thread(MITM_PORT, CA_DIR, _on_terminated, log=log.info, extra_hosts=_extra)
         log.info(f"  MITM front-end: 127.0.0.1:{MITM_PORT} (HTTPS_PROXY entrypoint)"
                  + (f", also intercepting {_extra[0]}" if _extra else ""))
+    except OSError as e:
+        # The port Claude Code is wired to is held by another process. Running
+        # on without it would leave a proxy that receives nothing while the
+        # stranger answers every session — exit so the hook sees the failure.
+        log.error(f"MITM port {MITM_PORT} is already in use ({e}); another proxy "
+                  f"(or a stray test run) is answering HTTPS_PROXY. Exiting.")
+        os._exit(1)
     except Exception as e:
         log.warning(f"MITM front-end disabled ({e!r}); HTTPS_PROXY entrypoint unavailable")
 

@@ -211,8 +211,32 @@ def _blind_tunnel(client: socket.socket, host: str, port: int) -> None:
                 pass
 
 
+def bind_listener(host: str, port: int) -> socket.socket:
+    """A listening socket that no other process can share.
+
+    On Windows SO_REUSEADDR does not mean "reuse a TIME_WAIT address" as it
+    does on POSIX — it lets a second process bind a port that is already
+    listening. Two proxies then split the connections between them, and one
+    that was started with a different CA (a test run's throwaway home) answers
+    TLS handshakes Claude Code cannot verify. SO_EXCLUSIVEADDRUSE makes that
+    second bind fail instead.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((host, port))
+        srv.listen(128)
+    except OSError:
+        srv.close()
+        raise
+    return srv
+
+
 def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1",
-          extra_hosts=()):
+          extra_hosts=(), listener=None):
     """Start the CONNECT front-end. Blocks; run in a thread.
 
     on_terminated(tls_sock, client_addr, sni_host) is called with a decrypted,
@@ -222,12 +246,16 @@ def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1"
     try:
         ca_cert_path, ctx, hosts = ensure_ca(ca_dir, extra_hosts)
     except ImportError:
+        if listener is not None:
+            listener.close()      # never hold a port open that never accepts
         if log:
             log("MITM front-end NOT started: the 'cryptography' package is missing, "
                 "so the local CA cannot be generated. Install it in this proxy's "
                 "environment (it is in requirements.txt). HTTPS_PROXY entrypoint is disabled.")
         return
     except Exception as e:  # noqa: BLE001
+        if listener is not None:
+            listener.close()
         if log:
             log(f"MITM front-end NOT started: CA setup failed ({e!r}). "
                 "HTTPS_PROXY entrypoint is disabled.")
@@ -236,10 +264,7 @@ def serve(mitm_port: int, ca_dir: str, on_terminated, log=None, host="127.0.0.1"
         log(f"MITM front-end: CA at {ca_cert_path}, intercepting {sorted(hosts)}")
 
     global _listener
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((host, mitm_port))
-    srv.listen(128)
+    srv = listener or bind_listener(host, mitm_port)
     _listener = srv
     if log:
         log(f"MITM front-end listening on {host}:{mitm_port}")
@@ -306,8 +331,12 @@ def close_listener():
 
 def start_in_thread(mitm_port: int, ca_dir: str, on_terminated, log=None,
                     extra_hosts=()) -> threading.Thread:
+    # Bind here, in the caller, so a port that is already taken raises where
+    # it can be acted on instead of dying silently inside the thread.
+    listener = bind_listener("127.0.0.1", mitm_port)
     t = threading.Thread(target=serve,
-                         args=(mitm_port, ca_dir, on_terminated, log, "127.0.0.1", extra_hosts),
+                         args=(mitm_port, ca_dir, on_terminated, log, "127.0.0.1", extra_hosts,
+                               listener),
                          daemon=True)
     t.start()
     return t

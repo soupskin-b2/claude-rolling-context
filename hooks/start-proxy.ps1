@@ -43,13 +43,49 @@ Log "Hook started. ProxyDir=$ProxyDir"
 # settings.json bookkeeping — CA generation, HTTPS_PROXY single-owner ownership,
 # chaining with pii-proxy, plugin defaults, stale-base_url cleanup — lives in
 # wire.py so it is one tested implementation shared with the sh hook and pii.
+#
+# LOCAL PATCH (fail-open guard): upstream wired HTTPS_PROXY unconditionally at
+# the top of this hook. If the MITM front-end never came up (e.g. the
+# 'cryptography' package missing), every Claude Code request then died with
+# ECONNREFUSED on 127.0.0.1:5590 while the health check on :5588 still said
+# "healthy". Wiring now happens in Sync-Wiring, which runs on EVERY exit path
+# (try/finally below) and only wires when the MITM port is really accepting
+# connections and the CA file exists; otherwise it unwires, so Claude Code
+# connects directly to api.anthropic.com instead of a dead port.
 $SettingsFile = Join-Path $ClaudeDir "settings.json"
-try {
-    $wireOut = & python (Join-Path $ProxyDir "wire.py") --name rolling-context --settings $SettingsFile 2>&1
-    foreach ($line in $wireOut) { Log "wire: $line" }
-} catch {
-    Log "WARNING: wire.py failed to update settings.json: $_"
+$WirePy = Join-Path $ProxyDir "wire.py"
+
+function Test-MitmReady {
+    $mp = 5590
+    if ($env:ROLLING_CONTEXT_MITM_PORT) { try { $mp = [int]$env:ROLLING_CONTEXT_MITM_PORT } catch {} }
+    if (-not (Test-Path (Join-Path $ClaudeDir "proxy-ca\ca-cert.pem"))) { return $false }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect("127.0.0.1", $mp, $null, $null)
+        return ($iar.AsyncWaitHandle.WaitOne(2000) -and $client.Connected)
+    } catch {
+        return $false
+    } finally {
+        $client.Close()
+    }
 }
+
+function Sync-Wiring {
+    try {
+        if (Test-MitmReady) {
+            $wireOut = & python $WirePy --name rolling-context --settings $SettingsFile 2>&1
+            foreach ($line in $wireOut) { Log "wire: $line" }
+        } else {
+            $wireOut = & python $WirePy --name rolling-context --settings $SettingsFile --unwire 2>&1
+            foreach ($line in $wireOut) { Log "unwire: $line" }
+            Log "GUARD: MITM front-end is not reachable (or CA missing) - removed HTTPS_PROXY wiring so Claude Code connects directly instead of to a dead port. Check rolling-context-debug.log (is 'cryptography' installed?)."
+        }
+    } catch {
+        Log "WARNING: wire.py failed to update settings.json: $_"
+    }
+}
+
+try {
 
 # --- Is the proxy actually SERVING? ------------------------------------------
 # Not "does a PID file exist", and not even "is that PID alive". A crashed
@@ -229,3 +265,7 @@ while ((Get-Date) -lt $deadline) {
 Log "ERROR: proxy did not answer on :$Port within ~8s of starting — see $ProxyLog"
 
 exit 0
+
+} finally {
+    Sync-Wiring
+}

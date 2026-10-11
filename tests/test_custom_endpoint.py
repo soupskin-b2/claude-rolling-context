@@ -72,7 +72,10 @@ def clean_env(home, **extra):
     # later would otherwise leak the developer's own shell into the test.
     for k in [k for k in env if k.startswith("ROLLING_CONTEXT_")]:
         env.pop(k, None)
-    env.update(HOME=home, USERPROFILE=home)
+    # Never the default MITM port: a test proxy there shares it with the
+    # user's real proxy (Windows) and answers their sessions with a test CA.
+    env.update(HOME=home, USERPROFILE=home,
+               ROLLING_CONTEXT_MITM_PORT=str(free_port()))
     env.update(extra)
     return env
 

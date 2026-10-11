@@ -75,7 +75,10 @@ def clean_env(home, **extra):
               "ROLLING_CONTEXT_MODEL", "ROLLING_CONTEXT_PORT",
               "ROLLING_CONTEXT_DISABLE", "ROLLING_CONTEXT_HOME"):
         env.pop(k, None)
-    env.update(HOME=home, USERPROFILE=home)
+    # Never the default MITM port: a test proxy there shares it with the
+    # user's real proxy (Windows) and answers their sessions with a test CA.
+    env.update(HOME=home, USERPROFILE=home,
+               ROLLING_CONTEXT_MITM_PORT=str(free_port()))
     env.update(extra)
     return env
 

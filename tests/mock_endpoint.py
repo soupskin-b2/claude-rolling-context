@@ -18,7 +18,11 @@ Env:
                          summary injected falls back under the trigger the way a
                          real one does. A constant makes every conversation
                          demand compaction forever, which is not a real workload.
+                         A message-threads continue still reports
+                         MOCK_INPUT_TOKENS: its history lives server-side, so the
+                         request's own size says nothing about the context.
 """
+import itertools
 import json
 import os
 import sys
@@ -31,6 +35,7 @@ BIG_INPUT = int(os.environ.get("MOCK_INPUT_TOKENS", "150000"))
 STRICT = os.environ.get("MOCK_STRICT") == "1"
 COMPACTION_DELAY = float(os.environ.get("MOCK_COMPACTION_DELAY", "0") or 0)
 TOKENS_FROM_SIZE = os.environ.get("MOCK_TOKENS_FROM_SIZE") == "1"
+_ids = itertools.count(1)
 
 # Native prompt carries the first, the flattened fallback prompt the second.
 COMPACTION_MARKERS = ("housekeeping request from me", "context compressor")
@@ -65,8 +70,11 @@ class Handler(BaseHTTPRequestHandler):
         msgs = payload.get("messages") or []
         last = json.dumps(msgs[-1]) if msgs else ""
         is_compaction = any(m in last for m in COMPACTION_MARKERS)
-        reported_input = (max(1, len(json.dumps(msgs)) // 4) if TOKENS_FROM_SIZE
+        thread = payload.get("thread") or {}
+        reported_input = (max(1, len(json.dumps(msgs)) // 4)
+                          if TOKENS_FROM_SIZE and thread.get("type") != "continue"
                           else BIG_INPUT)
+        msg_id = f"msg_mock_{next(_ids)}"
 
         note("request", {
             "path": self.path,
@@ -75,6 +83,10 @@ class Handler(BaseHTTPRequestHandler):
             "convo_chars": len(json.dumps(msgs)),
             "compaction": is_compaction,
             "carries_summary": any(SUMMARY_MARKER in json.dumps(m) for m in msgs),
+            "thread": thread.get("type"),
+            "roles": [m.get("role") for m in msgs],
+            "tool_additions": sum(json.dumps(m).count('"tool_addition"') for m in msgs),
+            "id": msg_id,
         })
 
         if STRICT:
@@ -96,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if not payload.get("stream"):
             self._send(200, "application/json", json.dumps({
-                "id": "msg_mock", "type": "message", "role": "assistant",
+                "id": msg_id, "type": "message", "role": "assistant",
                 "model": model, "content": [{"type": "text", "text": reply}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": reported_input, "output_tokens": 12},
@@ -105,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
 
         events = [
             {"type": "message_start", "message": {
-                "id": "msg_mock", "type": "message", "role": "assistant",
+                "id": msg_id, "type": "message", "role": "assistant",
                 "model": model, "content": [], "stop_reason": None,
                 "usage": {"input_tokens": reported_input, "output_tokens": 1,
                           "cache_creation_input_tokens": 0,

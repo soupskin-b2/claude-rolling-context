@@ -209,12 +209,23 @@ def wait_inflight(port, n, timeout=5):
     return False
 
 
+_mitm_ports = {}
+
+
+def mitm_port(port):
+    """A private MITM port per proxy port, stable across hook and manual
+    starts. Never the default 5590: a test proxy there shares it with the
+    user's real proxy (Windows) and answers their sessions with a test CA."""
+    return str(_mitm_ports.setdefault(port, free_port()))
+
+
 def run_hook(home, port, extra_env=None):
     env = dict(os.environ)
     for k in list(env):
         if k.startswith("ROLLING_CONTEXT_"):
             env.pop(k)
-    env.update(HOME=home, USERPROFILE=home, ROLLING_CONTEXT_PORT=str(port))
+    env.update(HOME=home, USERPROFILE=home, ROLLING_CONTEXT_PORT=str(port),
+               ROLLING_CONTEXT_MITM_PORT=mitm_port(port))
     env.update(extra_env or {})
     return subprocess.run([BASH, HOOK], capture_output=True, text=True,
                           env=env, timeout=180)
@@ -255,7 +266,8 @@ def write_pidfile(home, value, version=None):
 def start_proxy(home, port, plugin_root=ROOT):
     """Start the proxy the way the hook does, and wait for it to serve."""
     env = dict(os.environ)
-    env.update(HOME=home, USERPROFILE=home, ROLLING_CONTEXT_PORT=str(port))
+    env.update(HOME=home, USERPROFILE=home, ROLLING_CONTEXT_PORT=str(port),
+               ROLLING_CONTEXT_MITM_PORT=mitm_port(port))
     log = open(os.path.join(home, ".claude", "manual-proxy.log"), "ab")
     proc = subprocess.Popen([sys.executable, "server.py"],
                             cwd=os.path.join(plugin_root, "proxy"),

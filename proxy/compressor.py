@@ -112,6 +112,100 @@ def _clean_headers(headers: dict) -> dict:
 
 SUMMARY_MARKER = "[ROLLING_CONTEXT_SUMMARY]"
 SUMMARY_END_MARKER = "[/ROLLING_CONTEXT_SUMMARY]"
+# Tags the 'system' message the summary prefix carries forward (see
+# _carried_system). Its presence makes the prefix 3 messages instead of 2.
+CARRIED_MARKER = "[ROLLING_CONTEXT_CARRIED]"
+
+# Block types that change the conversation's tool set mid-conversation
+# (inline-tools beta). Summarizing them away would silently drop tools.
+_TOOL_CHANGE_BLOCKS = ("tool_addition", "tool_removal")
+
+
+def _is_carried(message: dict) -> bool:
+    if message.get("role") != "system":
+        return False
+    content = message.get("content")
+    return (isinstance(content, list) and content
+            and isinstance(content[0], dict)
+            and CARRIED_MARKER in str(content[0].get("text", "")))
+
+
+ACK_TEXT = (
+    "I have the full context from our previous conversation — "
+    "the timeline, all files modified, decisions made, and current state. "
+    "Continuing from where we left off."
+)
+
+
+def prefix_len(messages: list) -> int:
+    """Length of the injected summary prefix at the head of messages, or 0.
+
+    summary(user), then carried(system) when the summarized part held system
+    messages that had to survive verbatim, then ack(assistant) — except when
+    the kept part opens with an assistant turn (a cut inside a long tool loop),
+    which then answers the summary itself and the ack is left out.
+    """
+    if not messages:
+        return 0
+    content = messages[0].get("content", "")
+    if not (isinstance(content, str) and SUMMARY_MARKER in content):
+        return 0
+    n = 2 if len(messages) > 1 and _is_carried(messages[1]) else 1
+    if len(messages) > n and (messages[n].get("role") == "assistant"
+            and messages[n].get("content") == ACK_TEXT):
+        n += 1
+    return n
+
+
+def _strip_cache_control(block: dict) -> dict:
+    return {k: v for k, v in block.items() if k != "cache_control"}
+
+
+def _carried_system(old_carried, summarized: list):
+    """Build the 'system' message that keeps what a summary must not paraphrase.
+
+    Since message threads, Claude Code sends the session preamble (environment,
+    skill and MCP instructions) as a mid-conversation system message, with the
+    inline tool definitions (tool_addition) and the effort setting
+    (output_config) on it. Replacing it with a prose summary would drop MCP
+    tools and the environment from the model's view, so it is carried verbatim:
+    the preamble text of the first system message, every tool change in order,
+    and the latest output_config. cache_control is stripped — the prefix is
+    rewritten anyway, and the breakpoint budget is 4.
+    """
+    kept, output_config = [], None
+    first = old_carried is None  # the preamble was carried already otherwise
+    if old_carried is not None:
+        kept = list(old_carried.get("content", [])[1:])
+        output_config = old_carried.get("output_config")
+    for msg in summarized:
+        if msg.get("role") != "system" or _is_carried(msg):
+            continue
+        content = msg.get("content")
+        # Replays send some system messages as a bare string.
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        blocks = [b for b in content or [] if isinstance(b, dict)]
+        changes_tools = any(b.get("type") in _TOOL_CHANGE_BLOCKS for b in blocks)
+        # The first one is the preamble; one that changes tools keeps its
+        # text too, since that text describes the tools it adds.
+        if first or changes_tools:
+            kept += [_strip_cache_control(b) for b in blocks
+                     if b.get("type") == "text" or b.get("type") in _TOOL_CHANGE_BLOCKS]
+        first = False
+        if msg.get("output_config") is not None:
+            output_config = msg["output_config"]
+    if not (kept or output_config):
+        return None
+    carried = {
+        "role": "system",
+        "content": [{"type": "text", "text": (
+            f"{CARRIED_MARKER} Session setup carried over verbatim from the "
+            "summarized part of this conversation.")}] + kept,
+    }
+    if output_config is not None:
+        carried["output_config"] = output_config
+    return carried
 
 SUMMARY_RULES = """RULES:
 - Structure as a TIMELINE: use numbered steps showing what happened in order
@@ -329,21 +423,26 @@ class RollingCompressor:
     def _safe_cut(self, messages: list, cut: int, floor: int) -> int:
         """Walk cut back to a boundary where messages[cut:] is a valid start.
 
-        Two rules, both enforced by the real API:
-        - messages[cut] must be a plain 'user' message (no tool_result). If it's
-          an assistant, a tool_result, or a 'system' directive, the injected
-          prefix [summary(user), ack(assistant)] can't legally precede it — a
-          system message in particular must sit between a user turn and a
-          following assistant turn (user, system, assistant), so it can never
-          be the first kept message.
-        - messages[cut-1] (last summarized) must carry no tool_use, or its
-          tool_results would be orphaned in the kept half.
+        Two kinds of boundary are valid, both enforced by the real API:
+        - a plain 'user' message (no tool_result) whose predecessor carries no
+          tool_use (its tool_results would be orphaned in the kept half). The
+          prefix [summary(user), ack(assistant)] goes in front of it.
+        - the start of an assistant turn right after a user or system message:
+          that message's tool_results answer tool_uses already summarized, so
+          nothing is orphaned, and the kept assistant turn itself answers the
+          summary (no ack). This is the only boundary inside a long autonomous
+          tool loop, where the last plain user message can be hours back — a
+          loop like that could otherwise never be compressed at all.
+        A 'system' message is never the first kept one: it must follow a user
+        turn.
         """
         while cut > floor:
             m = messages[cut]
+            prev = messages[cut - 1]
             starts_clean = m.get("role") == "user" and not self._has_tool_result(m)
-            prev_clean = not self._has_tool_use(messages[cut - 1])
-            if starts_clean and prev_clean:
+            if starts_clean and not self._has_tool_use(prev):
+                return cut
+            if m.get("role") == "assistant" and prev.get("role") in ("user", "system"):
                 return cut
             cut -= 1
         return cut
@@ -450,6 +549,12 @@ class RollingCompressor:
         classification sees genuine Claude Code session traffic.
         """
         convo = list(messages[:cut])
+        # A system message must be followed by an assistant turn, so one that
+        # ends the summarized part (a reminder after tool results) cannot sit
+        # in front of the compact instruction. It is a per-turn reminder; the
+        # summary loses nothing without it.
+        while convo and convo[-1].get("role") == "system":
+            convo.pop()
 
         # Place a cache breakpoint on the last conversation message (budget
         # permitting, max 4 per request) so the lookup reads the deepest
@@ -645,7 +750,7 @@ class RollingCompressor:
         keep_from_idx = self._find_keep_index(messages, keep_ratio)
 
         has_existing_summary = self._has_summary(messages)
-        start_idx = 2 if has_existing_summary else 0
+        start_idx = prefix_len(messages)
 
         keep_from_idx = self._safe_cut(messages, keep_from_idx, start_idx)
 
@@ -711,16 +816,18 @@ class RollingCompressor:
                 "Continue from where we left off."
             ),
         }
-        ack_message = {
-            "role": "assistant",
-            "content": (
-                "I have the full context from our previous conversation — "
-                "the timeline, all files modified, decisions made, and current state. "
-                "Continuing from where we left off."
-            ),
-        }
+        ack_message = {"role": "assistant", "content": ACK_TEXT}
 
-        compressed = [summary_message, ack_message] + recent_messages
+        old_carried = messages[1] if start_idx == 3 else None
+        carried = _carried_system(old_carried, messages[start_idx:keep_from_idx])
+        if carried is not None:
+            tools = sum(1 for b in carried["content"] if b.get("type") in _TOOL_CHANGE_BLOCKS)
+            log.info(f"Carrying a system message forward ({tools} tool change(s), "
+                     f"{len(carried['content']) - 1 - tools} preamble block(s))")
+        opens_with_assistant = recent_messages[0].get("role") == "assistant"
+        prefix = ([summary_message] + ([carried] if carried else [])
+                  + ([] if opens_with_assistant else [ack_message]))
+        compressed = prefix + recent_messages
 
         original_chars = self._count_chars(messages)
         compressed_chars = self._count_chars(compressed)
