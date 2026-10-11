@@ -257,10 +257,14 @@ if ($decision -eq "same") {
 
 # Start proxy directly with system python — no venv needed
 Log "Starting proxy..."
+# No -RedirectStandard*: with it, Start-Process hands the proxy this hook's
+# own stdout/stderr pipes, and the caller (/roll restart, SessionStart) waits
+# on them until the proxy exits - /roll restart hung ~30s after it was done.
+# server.py opens the log files itself from ROLLING_CONTEXT_STDIO_LOG.
+$env:ROLLING_CONTEXT_STDIO_LOG = $ProxyLog
 $proc = Start-Process -FilePath "python" -ArgumentList "server.py" `
-    -WorkingDirectory $ProxyDir `
-    -RedirectStandardOutput $ProxyLog -RedirectStandardError "$ProxyLog.err" `
-    -WindowStyle Hidden -PassThru
+    -WorkingDirectory $ProxyDir -WindowStyle Hidden -PassThru
+Remove-Item Env:ROLLING_CONTEXT_STDIO_LOG -ErrorAction SilentlyContinue
 Log "Proxy started with PID $($proc.Id) (v$CurrentVersion)"
 
 # Confirm it came up, rather than assuming. A start that fails — port taken,

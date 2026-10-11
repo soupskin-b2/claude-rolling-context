@@ -276,7 +276,9 @@ fi
 log "Starting proxy..."
 (
     cd "$PROXY_DIR" || exit 1
-    nohup $PYTHON_CMD server.py > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
+    # Every stdio stream off the caller's pipes, or whoever ran this hook
+    # waits on them for as long as the proxy lives.
+    nohup $PYTHON_CMD server.py < /dev/null > "$HOME/.claude/rolling-context-proxy.log" 2>&1 &
 )
 
 # Confirm it came up, rather than assuming. A start that fails — port taken,

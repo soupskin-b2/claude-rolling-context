@@ -12,6 +12,26 @@ No sessions, no fingerprints — just content recognition.
 Pure stdlib — no external dependencies needed.
 """
 
+import os as _os
+import sys as _sys
+
+# Started by start-proxy.ps1 with no redirection: Start-Process -Redirect*
+# makes the child inherit the hook's own stdout/stderr pipes, and whoever ran
+# the hook (`/roll restart`, the SessionStart hook) waits on them until this
+# long-lived process exits - in practice, until its timeout. The hook names
+# the files instead, and they are opened here, before any import can fail.
+_stdio_log = _os.environ.pop("ROLLING_CONTEXT_STDIO_LOG", "")
+if _stdio_log:
+    try:
+        for _fd, _path in ((1, _stdio_log), (2, _stdio_log + ".err")):
+            _h = _os.open(_path, _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o644)
+            _os.dup2(_h, _fd)
+            _os.close(_h)
+        _sys.stdout = open(1, "w", encoding="utf-8", errors="replace", buffering=1, closefd=False)
+        _sys.stderr = open(2, "w", encoding="utf-8", errors="replace", buffering=1, closefd=False)
+    except OSError:
+        pass
+
 import hashlib
 import itertools
 import json
