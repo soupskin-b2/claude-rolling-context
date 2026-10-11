@@ -76,6 +76,15 @@ Instead of replacing everything, this plugin:
 
 ## Install
 
+### This fork
+
+Installs rolling-context from this repository instead of upstream (disable or
+uninstall `rolling-context@nestor-plugins` first so only one proxy hook runs):
+
+```
+/plugin install rolling-context --marketplace soupskin-b2/claude-rolling-context
+```
+
 ### Option 1: Claude Code Plugin (recommended)
 
 Run these two commands inside Claude Code:
@@ -218,14 +227,25 @@ optimization pass where the model should see everything. Compression is not
 what you want there.
 
 ```
-/rolling-context:off      # this conversation only, other sessions unaffected
-/rolling-context:on       # back on
+/rc off            # this conversation only, other sessions unaffected
+/rc on             # back on
 
-/rolling-context:off --global   # every session on this machine
-/rolling-context:on --global
+/rc off --global   # every session on this machine
+/rc on --global
 
-/rolling-context:status   # what is the machine-wide setting?
+/rc                # status: this session, machine-wide, and the /config values
+/rc restart        # restart the proxy now
 ```
+
+`/rc` runs at once, **even while Claude is mid-turn**, and never starts a
+Claude turn: the plugin's mod runs the switch itself and prints the result.
+A status line under the prompt shows whether this session is compressing and
+what it has saved (turn it off in `/config`).
+
+The older `/rolling-context:status|on|off|restart` commands still work. Where
+mods load (the CLI and the desktop app's Code tab, Claude Code 2.1.287+), the
+mod answers them too, without a Claude turn, and hides them from the menu in
+favour of `/rc`. Elsewhere they are prompt templates Claude runs for you.
 
 Both scopes apply from the **next request** — no Claude Code restart, no proxy
 restart. Machine-wide off wins over a session that opted in.
@@ -245,40 +265,51 @@ session, flip the default in `~/.claude-rolling-context/config.json`:
 { "enabled": false }
 ```
 
-Sessions that have not run `/rolling-context:off` or `:on` follow this;
+Sessions that have not run `/rc off` or `/rc on` follow this;
 an explicit toggle in a session always wins over it. A missing or malformed
 config falls back to on, so a typo can never silently disable your install.
-`/rolling-context:status` prints the current default and the config path.
+`/rc` prints the current default.
 
 ### Subagents follow the session that spawned them
 
-`/rolling-context:off` covers the subagents your session launches, so a
-planning session where agents explore the repo keeps full context everywhere —
-not just in the main thread.
+`/rc off` covers the subagents your session launches, so a planning session
+where agents explore the repo keeps full context everywhere — not just in the
+main thread.
 
-The command prints a marker into the transcript, and the proxy latches it
-against the `X-Claude-Code-Session-Id` header Claude Code sends on every
-request. A subagent gets its own transcript, so it never carries the marker,
-but it inherits its parent's session id — which is what carries the setting in.
-Other sessions on the same machine are unaffected either way.
+The command records the choice in `~/.claude-rolling-context/sessions/<id>.json`,
+keyed by the session id Claude Code sends on every request as
+`X-Claude-Code-Session-Id`. A subagent gets its own transcript but inherits its
+parent's session id, which is what carries the setting in. Other sessions on
+the same machine are unaffected. The file survives proxy restarts and
+`/compact`, and a resumed session keeps its id and so its setting. Files
+untouched for 90 days are swept when the proxy starts.
 
-The latch also outlives the marker: if a conversation is `/compact`ed and the
-marker is summarized away, the session keeps its setting.
-
-One caveat: the latch lives in the proxy's memory, bounded to the 512 most
-recent sessions. Restart the proxy (or blow past 512 sessions) and it forgets,
-so a session falls back to the machine-wide setting until its next marker is
-seen. That costs savings for a request, never correctness — and re-running
-`/rolling-context:off` restores it.
+Older versions printed a marker into the transcript instead. The proxy still
+honours one in real slash-command output, but a state file wins over it, and a
+marker merely quoted inside a tool result (reading this plugin's source, say)
+no longer toggles anything.
 
 ## Configuration
 
-All settings via environment variables (all optional — defaults work great):
+The everyday settings are rows in **`/config`**, under rolling-context. The
+proxy reads them live, so a change applies from the next request with no
+restart:
+
+| `/config` row | Default | Description |
+|---------------|---------|-------------|
+| Compress when context exceeds (tokens) | `100000` | The trigger |
+| Recent context kept verbatim (tokens) | `40000` | The target; kept below the trigger |
+| Delete unused compressions after | `14 days` | 1 hour to 30 days, or Never. A compression not injected into any request for this long is deleted from memory and from disk |
+| Show status line | on | The line under the prompt |
+
+A value set in `/config` wins over the matching environment variable below.
+
+Everything else is an environment variable (all optional — defaults work great):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ROLLING_CONTEXT_TRIGGER` | `100000` | Compress when context exceeds this many tokens |
-| `ROLLING_CONTEXT_TARGET` | `40000` | Keep this many tokens of recent messages after compression |
+| `ROLLING_CONTEXT_TRIGGER` | `100000` | Trigger, when `/config` has no value |
+| `ROLLING_CONTEXT_TARGET` | `40000` | Target, when `/config` has no value |
 | `ROLLING_CONTEXT_MODEL` | *(session model)* | Summarizer model; unset = the session's own model (prompt-cache hit) |
 | `ROLLING_CONTEXT_PORT` | `5588` | Proxy listen port |
 | `ROLLING_CONTEXT_UPSTREAM` | `https://api.anthropic.com` | Upstream API URL (chain to another proxy!) |
@@ -288,7 +319,7 @@ All settings via environment variables (all optional — defaults work great):
 | `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
 | `ROLLING_CONTEXT_FALLBACK_MODEL` | `claude-sonnet-5` | Model for the one retry when native compaction returns a 200 with no text (a refusal or a thinking-only answer on reasoning models) |
 | `ROLLING_CONTEXT_DISABLE` | *(unset)* | `1` = off everywhere; wins over `/rolling-context:on --global` |
-| `ROLLING_CONTEXT_HOME` | `~/.claude-rolling-context` | Where the machine-wide off flag lives |
+| `ROLLING_CONTEXT_HOME` | `~/.claude-rolling-context` | Where the machine-wide off flag, the per-session state files and the saved compressions live |
 | `ROLLING_CONTEXT_MAX_CONCURRENT` | `4` | Background compactions allowed at once across all conversations. A conversation with no summary yet is admitted past this (up to 2x) rather than be starved |
 | `ROLLING_CONTEXT_LOG_LEVEL` | `INFO` | `DEBUG` for per-request match detail (verbose, and it writes conversation content to disk) |
 | `ROLLING_CONTEXT_LOG_MAX_MB` | `10` | Rotate `rolling-context-debug.log` at this size |
@@ -379,7 +410,7 @@ proxy to answer before it exits, and says which of these happened:
 | `proxy did not answer on :5588 within ~8s` | It failed to start — see `~/.claude/rolling-context-proxy.log`. |
 | `Proxy vX is newer than this plugin` | A session on a newer plugin version already upgraded it. Left alone; never downgraded. |
 | `waiting for it to go idle before upgrading` | An older proxy has requests in flight; the hook waits up to ~6s. |
-| `Deferring upgrade: proxy vX still has N in flight` | It stayed busy. This session uses the old proxy; the upgrade happens at a later idle session start, or now via `/rolling-context:restart`. |
+| `Deferring upgrade: proxy vX still has N in flight` | It stayed busy. This session uses the old proxy; the upgrade happens at a later idle session start, or now via `/rc restart`. |
 
 ### Upgrades never cut a running stream
 
@@ -399,7 +430,7 @@ log). Since v1.13.2:
   field are judged by their established client sockets instead.
 - **Drain on SIGTERM.** The proxy stops accepting, finishes what is in flight
   (up to `ROLLING_CONTEXT_DRAIN_SECONDS`, default 20), then exits.
-- **`/rolling-context:restart`** forces a restart when you want the new version
+- **`/rc restart`** (or `/rolling-context:restart`) forces a restart when you want the new version
   now; it still waits briefly for in-flight requests.
 
 Sessions still running a pre-1.13.2 plugin keep the old "restart on any

@@ -1,9 +1,40 @@
 {
   "name": "rolling-context",
-  "version": "1.13.4",
-  "description": "Rolling context compression - old messages get summarized, recent messages stay verbatim. Never hit the context wall. Toggle it off per session with /rolling-context:off (or --global) when a session wants the full history - subagents follow the session that spawned them, and nothing already compressed is thrown away.",
+  "version": "1.14.0",
+  "description": "Rolling context compression - old messages get summarized, recent messages stay verbatim. Never hit the context wall. /rc shows status and toggles it (per session, or --global) at once, even mid-turn, without a Claude turn - subagents follow the session that spawned them, and nothing already compressed is thrown away. Trigger, target and how long unused compressions are kept are set in /config.",
   "author": {
     "name": "NodeNestor"
   },
-  "homepage": "https://github.com/NodeNestor/claude-rolling-context"
+  "homepage": "https://github.com/NodeNestor/claude-rolling-context",
+  "userConfig": {
+    "trigger_tokens": {
+      "type": "number",
+      "title": "Compress when context exceeds (tokens)",
+      "description": "Once a request reports more input tokens than this, older messages are summarized in the background. Applies from the next request.",
+      "default": 100000,
+      "min": 20000,
+      "max": 2000000
+    },
+    "target_tokens": {
+      "type": "number",
+      "title": "Recent context kept verbatim (tokens)",
+      "description": "How much of the most recent conversation stays word for word after a compression. Kept below the trigger (capped at half of it otherwise).",
+      "default": 40000,
+      "min": 5000,
+      "max": 1000000
+    },
+    "retention": {
+      "type": "string",
+      "title": "Delete unused compressions after",
+      "description": "A stored compression that has not been injected into any request for this long is deleted from memory and disk. Never keeps them while the proxy runs (at most 64 survive a restart).",
+      "options": ["1 hour", "6 hours", "1 day", "3 days", "7 days", "14 days", "30 days", "Never"],
+      "default": "14 days"
+    },
+    "status_line": {
+      "type": "boolean",
+      "title": "Show status line",
+      "description": "A line under the prompt with whether compression is on for this session and what it has saved.",
+      "default": true
+    }
+  }
 }

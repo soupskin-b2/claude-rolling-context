@@ -54,10 +54,13 @@ CASES = [
     ("found inside list-shaped content blocks",
      [blocks("chatter", stdout_block(OFF))], True),
 
-    ("found inside a nested tool_result content list",
+    # A tool result is never command output, even with the tags inside: that
+    # is how reading this plugin's source used to switch a session off. The
+    # slash command's real path is now the session state file.
+    ("NOT found inside a nested tool_result content list",
      [{"role": "user", "content": [
          {"type": "tool_result", "content": [
-             {"type": "text", "text": stdout_block(OFF)}]}]}], True),
+             {"type": "text", "text": stdout_block(OFF)}]}]}], None),
 
     # The false-positive guard. Reading or grepping the plugin's own source in
     # a conversation puts the literal marker in a tool result, which is a
@@ -79,6 +82,20 @@ CASES = [
       user(stdout_block(OFF))], True),
 
     ("empty history -> None", [], None),
+
+    # What actually happened in the wild: a tool result that quoted this
+    # proxy's source, where an opening tag, the marker and a closing tag
+    # happened to fall in that order. It is not command output.
+    ("tags + marker inside a tool_result are IGNORED",
+     [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+       "content": f'r"<local-command-stdout>(.*?)" ... MARKER_OFF = "{OFF}" ... '
+                  f'"</local-command-stdout>"'}]}], None),
+
+    ("a user message that only quotes a command block mid-text is IGNORED",
+     [user(f"look at this: {stdout_block(OFF)}")], None),
+
+    ("an assistant message is never command output",
+     [{"role": "assistant", "content": stdout_block(OFF)}], None),
 ]
 
 

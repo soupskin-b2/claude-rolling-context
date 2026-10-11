@@ -73,7 +73,11 @@ def clean_env(home, **extra):
     for k in ("ROLLING_CONTEXT_UPSTREAM", "ROLLING_CONTEXT_SUMMARIZER_URL",
               "ROLLING_CONTEXT_SUMMARIZER_KEY", "ROLLING_CONTEXT_SUMMARIZER_FORMAT",
               "ROLLING_CONTEXT_MODEL", "ROLLING_CONTEXT_PORT",
-              "ROLLING_CONTEXT_DISABLE", "ROLLING_CONTEXT_HOME"):
+              "ROLLING_CONTEXT_DISABLE", "ROLLING_CONTEXT_HOME",
+              # Run from inside Claude Code, switch.py would record the
+              # developer's own session instead of printing the marker these
+              # legacy cases test. session_files() covers that path.
+              "CLAUDE_CODE_SESSION_ID"):
         env.pop(k, None)
     # Never the default MITM port: a test proxy there shares it with the
     # user's real proxy (Windows) and answers their sessions with a test CA.
@@ -594,6 +598,90 @@ def subagent_inheritance(root):
     return sum(1 for ok in results if not ok)
 
 
+def session_files(root):
+    """/rc (and /rolling-context:on|off run inside Claude Code) record the
+    session's choice in a state file keyed by its session id, instead of a
+    marker. Same reach as the marker had: the session's subagents follow it,
+    other sessions do not, and it wins over a stale marker in the transcript.
+    """
+    print("  session state files")
+    work = os.path.join(root, "sessfiles")
+    switch_home = os.path.join(work, "flag")
+    os.makedirs(switch_home, exist_ok=True)
+    results = []
+    PARENT, OTHER = "sess-file-parent", "sess-file-other"
+
+    rc, out = switch_cmd(switch_home, "off", "--session", PARENT)
+    state_file = os.path.join(switch_home, "sessions", PARENT + ".json")
+    check(results, "off --session writes a state file and prints no marker",
+          rc == 0 and os.path.exists(state_file) and SESSION_OFF not in out)
+    rc, out = switch_cmd(switch_home, "off", CLAUDE_CODE_SESSION_ID=OTHER + "-env")
+    check(results, "CLAUDE_CODE_SESSION_ID is used when --session is not given",
+          os.path.exists(os.path.join(switch_home, "sessions", OTHER + "-env.json")))
+    rc, out = switch_cmd(switch_home, "status", "--session", PARENT)
+    check(results, "status reports this session's own state",
+          "this session: OFF" in out, out.splitlines()[2] if len(out.splitlines()) > 2 else out)
+
+    mock_port, proxy_port = free_port(), free_port()
+    log = os.path.join(work, "mock.jsonl")
+    mock, proxy = start_stack(work, switch_home, mock_port, proxy_port, log)
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{proxy_port}/health?session={PARENT}", timeout=10) as r:
+            h = json.loads(r.read())
+        check(results, "/health?session= reports the session as off",
+              h.get("session") == {"enabled": False, "scope": "this session"}, str(h.get("session")))
+
+        p1 = conversation(24, "parent turn one")
+        post(proxy_port, p1, session_id=PARENT)
+        time.sleep(6)
+        p2 = p1 + [{"role": "assistant", "content": "ok"},
+                   {"role": "user", "content": "parent turn two"}]
+        post(proxy_port, p2, session_id=PARENT)
+        time.sleep(1)
+
+        o1 = conversation(24, "other session turn one")
+        o1[0] = {"role": "user", "content": "other divergence " + "o" * 400}
+        post(proxy_port, o1, session_id=OTHER)
+        time.sleep(6)
+        o2 = o1 + [{"role": "assistant", "content": "ok"},
+                   {"role": "user", "content": "other turn two"}]
+        post(proxy_port, o2, session_id=OTHER)
+        time.sleep(1)
+
+        # Back on through the file, while the transcript still carries an
+        # old "off" marker from before state files: the file wins.
+        switch_cmd(switch_home, "on", "--session", PARENT)
+        p3 = p2 + [{"role": "assistant", "content": "ok"}, marked("off"),
+                   {"role": "assistant", "content": "ok"},
+                   {"role": "user", "content": "parent turn three"}]
+        post(proxy_port, p3, session_id=PARENT)
+        time.sleep(6)
+        p4 = p3 + [{"role": "assistant", "content": "ok"},
+                   {"role": "user", "content": "parent turn four"}]
+        post(proxy_port, p4, session_id=PARENT)
+        time.sleep(1)
+    finally:
+        proxy.terminate()
+        mock.terminate()
+
+    chat = [r for r in requests_from(log) if not r["compaction"]]
+    p2_req, o2_req, p4_req = chat[1], chat[3], chat[5]
+    check(results, "the session that turned off sends its full history",
+          not p2_req["carries_summary"]
+          and p2_req["convo_chars"] >= len(json.dumps(p2)) * 0.99,
+          f"{p2_req['convo_chars']:,} chars sent vs {len(json.dumps(p2)):,} held")
+    check(results, "another session is NOT affected",
+          o2_req["carries_summary"]
+          and o2_req["convo_chars"] < len(json.dumps(o2)) * 0.75,
+          f"{o2_req['convo_chars']:,} chars sent vs {len(json.dumps(o2)):,} held")
+    check(results, "on through the file wins over a stale off marker",
+          p4_req["carries_summary"]
+          and p4_req["convo_chars"] < len(json.dumps(p4)) * 0.75,
+          f"{p4_req['convo_chars']:,} chars sent vs {len(json.dumps(p4)):,} held")
+    return sum(1 for ok in results if not ok)
+
+
 def latch_unit(root):
     """The latch survives losing the marker, and is bounded."""
     print("  session latch")
@@ -648,6 +736,8 @@ def main():
         failures += latch_unit(root)
         print()
         failures += subagent_inheritance(root)
+        print()
+        failures += session_files(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -40,13 +40,33 @@ log "Hook started. PROXY_DIR=$PROXY_DIR IS_WINDOWS=$IS_WINDOWS"
 # generation, HTTPS_PROXY single-owner ownership, chaining with pii-proxy,
 # plugin defaults and stale-base_url cleanup all live in wire.py — one tested
 # implementation shared with the PowerShell hook and with pii-proxy.
+#
+# Fail-open guard, as in start-proxy.ps1: wiring HTTPS_PROXY unconditionally
+# meant that a MITM front-end that never came up (the 'cryptography' package
+# missing, say) broke every Claude Code request with ECONNREFUSED on :5590
+# while /health on :5588 still read healthy. _sync_wiring runs on every exit
+# path (the EXIT trap) and wires only when the MITM port is accepting and the
+# CA exists; otherwise it unwires, so Claude Code goes direct instead.
 SETTINGS_FILE="$HOME/.claude/settings.json"
-WIRE_OUT=$($PYTHON_CMD "$PROXY_DIR/wire.py" --name rolling-context --settings "$SETTINGS_FILE" 2>&1)
-if [ $? -eq 0 ]; then
-    while IFS= read -r line; do [ -n "$line" ] && log "wire:$line"; done <<< "$WIRE_OUT"
-else
-    log "WARNING: wire.py failed to update settings.json: $WIRE_OUT"
-fi
+MITM_PORT="${ROLLING_CONTEXT_MITM_PORT:-5590}"
+
+_mitm_ready() {
+    [ -f "$HOME/.claude/proxy-ca/ca-cert.pem" ] || return 1
+    $PYTHON_CMD -c "import socket,sys; socket.create_connection(('127.0.0.1', int(sys.argv[1])), 2).close()" "$MITM_PORT" 2>/dev/null
+}
+
+_sync_wiring() {
+    local out
+    if _mitm_ready; then
+        out=$($PYTHON_CMD "$PROXY_DIR/wire.py" --name rolling-context --settings "$SETTINGS_FILE" 2>&1)             || { log "WARNING: wire.py failed to update settings.json: $out"; return; }
+        while IFS= read -r line; do [ -n "$line" ] && log "wire:$line"; done <<< "$out"
+    else
+        out=$($PYTHON_CMD "$PROXY_DIR/wire.py" --name rolling-context --settings "$SETTINGS_FILE" --unwire 2>&1)             || { log "WARNING: wire.py failed to update settings.json: $out"; return; }
+        while IFS= read -r line; do [ -n "$line" ] && log "unwire:$line"; done <<< "$out"
+        log "GUARD: MITM front-end is not reachable on :$MITM_PORT (or CA missing) - removed HTTPS_PROXY wiring so Claude Code connects directly instead of to a dead port. Check rolling-context-proxy.log (is 'cryptography' installed?)."
+    fi
+}
+trap _sync_wiring EXIT
 
 # Check if proxy is already running
 _kill_pid() {

@@ -1,0 +1,14 @@
+{
+  "name": "soupskin-plugins",
+  "description": "soupskin-b2's fork of rolling-context.",
+  "owner": {
+    "name": "soupskin-b2"
+  },
+  "plugins": [
+    {
+      "name": "rolling-context",
+      "source": "./",
+      "description": "Fork of NodeNestor/claude-rolling-context: message-threads support, /rc without a Claude turn, /config options and compression retention."
+    }
+  ]
+}

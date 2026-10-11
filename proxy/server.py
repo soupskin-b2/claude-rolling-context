@@ -26,7 +26,7 @@ import socket
 import ssl
 import http.client
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import endpoints
 import switch
@@ -139,8 +139,11 @@ def _track_request(method):
     return wrap
 
 UPSTREAM_URL = endpoints.load_upstream(LISTEN_PORT)
-TRIGGER_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TRIGGER") or "100000")
-TARGET_TOKENS = int(os.environ.get("ROLLING_CONTEXT_TARGET") or "40000")
+# Live: /config (pluginConfigs in settings.json) first, then the environment
+# this proxy was started with, then the defaults. _refresh_limits() re-reads
+# them on every request, so a change in /config applies from the next one.
+TRIGGER_TOKENS = switch.trigger_tokens()[0]
+TARGET_TOKENS = switch.target_tokens()[0]
 # Empty = native mode compresses with the session's own model (prompt-cache
 # hit); set to pin a specific summarizer model.
 SUMMARIZER_MODEL = os.environ.get("ROLLING_CONTEXT_MODEL") or ""
@@ -182,6 +185,17 @@ compressor = RollingCompressor(
 )
 
 
+def _refresh_limits():
+    """Pick up a trigger/target changed in /config since the last request."""
+    global TRIGGER_TOKENS, TARGET_TOKENS
+    trigger, target = switch.trigger_tokens()[0], switch.target_tokens()[0]
+    if (trigger, target) != (TRIGGER_TOKENS, TARGET_TOKENS):
+        log.info(f"[CONFIG] trigger {TRIGGER_TOKENS:,} -> {trigger:,}, "
+                 f"target {TARGET_TOKENS:,} -> {target:,}")
+        TRIGGER_TOKENS, TARGET_TOKENS = trigger, target
+        compressor.trigger_tokens, compressor.target_tokens = trigger, target
+
+
 def _upstream_conn():
     """Create a connection to the upstream server."""
     if _parsed_upstream.scheme == "https":
@@ -219,37 +233,17 @@ def _strip_volatile_tags(text: str) -> str:
 
 
 # --- per-session toggle (issue #6) ------------------------------------------
-# /rolling-context:off prints a marker; slash command output is inserted into
-# the transcript inside <local-command-stdout>, so every later request in that
-# conversation carries it. Reading the newest marker gives us per-session scope
-# without tracking sessions — the same content recognition the proxy already
-# runs on. Matching is confined to <local-command-stdout> blocks so that merely
-# reading switch.py in a conversation (a tool result, not a command block)
-# cannot toggle anything.
+# The session's own choice lives in a state file keyed by its Claude Code
+# session id (switch.session_disabled). Before that, /rolling-context:off
+# printed a marker meant to land in the transcript inside
+# <local-command-stdout>; it is still honoured, but only in a user message
+# that IS command output (_command_output_texts), so a tool result that quotes
+# the marker between the tags — reading switch.py, say — toggles nothing.
 
 _STDOUT_BLOCK_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL
 )
 _SESSION_MARKER_RE = re.compile(r"<<rolling-context:session-(off|on)>>")
-
-
-def _iter_text(content):
-    """Yield the plain-text pieces of a message without serializing it.
-
-    Deliberately not json.dumps — this runs over the whole history on every
-    request, and the marker only ever lives in text.
-    """
-    if isinstance(content, str):
-        yield content
-    elif isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    yield text
-                nested = block.get("content")
-                if isinstance(nested, (str, list)):
-                    yield from _iter_text(nested)
 
 
 class SessionToggleStore:
@@ -301,14 +295,39 @@ class SessionToggleStore:
 session_toggles = SessionToggleStore()
 
 
+def _command_output_texts(message: dict):
+    """The texts of a message that are real slash-command output.
+
+    Claude Code records a local command's output as a user message whose text
+    starts with <local-command-stdout>. Anything else that merely contains the
+    tag (a tool result quoting this proxy's source, a file read, a pasted log)
+    is not command output, however its tags happen to pair up.
+    """
+    if message.get("role") != "user":
+        return
+    content = message.get("content", "")
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [b.get("text") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+    else:
+        return
+    for text in texts:
+        if isinstance(text, str) and text.lstrip().startswith("<local-command-stdout>"):
+            yield text
+
+
 def _session_disabled(messages: list):
-    """Newest /rolling-context session marker in this conversation.
+    """Newest legacy /rolling-context session marker in this conversation.
 
     Returns True (off), False (on), or None (never set — follow the machine
-    setting). Scans newest-first so the last toggle wins.
+    setting). Scans newest-first so the last toggle wins. Session state files
+    (switch.session_disabled) take precedence; this only covers transcripts
+    from before them.
     """
     for msg in reversed(messages):
-        for text in _iter_text(msg.get("content", "")):
+        for text in _command_output_texts(msg):
             # Cheap reject first: the vast majority of messages never match.
             if "rolling-context:session-" not in text:
                 continue
@@ -640,7 +659,12 @@ STORE_PATH = os.environ.get("ROLLING_CONTEXT_STORE_PATH") or os.path.join(
 _STORE_VERSION = 1
 _STORE_MAX_ENTRIES = 64           # newest ready compressions kept on disk
 _STORE_MAX_CHAINS = 1024          # newest thread anchors kept on disk
-_STORE_MAX_AGE = 14 * 86400       # an anchor or summary older than this is dead
+_STORE_MAX_AGE = 14 * 86400       # thread anchors older than this are dead
+# How long an unused compression lives is the user's call (the "Delete unused
+# compressions after" row in /config, switch.retention()): _prune_expired drops
+# it from memory and so from disk. A compression is "used" when it is made and
+# each time it is injected into a request.
+_PRUNE_INTERVAL = 60
 _persist_dirty = threading.Event()
 
 
@@ -659,6 +683,7 @@ def _snapshot_state() -> dict:
         "prefix": e["prefix"],
         "rebase_requested": bool(e.get("rebase_requested")),
         "saved_at": e.setdefault("saved_at", time.time()),
+        "last_used": _last_used(e),
     } for e in ready]
     with _threads_lock:
         items = list(_thread_chains.items())[-_STORE_MAX_CHAINS:]
@@ -706,10 +731,14 @@ def _load_state():
         log.info(f"[STORE] Ignoring {STORE_PATH} (version {state.get('version')})")
         return
     now = time.time()
+    keep_for = switch.retention()[1]
     max_eid = 0
     loaded = []
+    expired = 0
     for d in state.get("entries", []):
-        if now - d.get("saved_at", 0) > _STORE_MAX_AGE:
+        last_used = d.get("last_used") or d.get("saved_at", 0)
+        if keep_for is not None and now - last_used > keep_for:
+            expired += 1
             continue
         if not d.get("original_hashes") or not d.get("prefix"):
             continue
@@ -719,6 +748,7 @@ def _load_state():
             "pending": None, "pending_hashes": None, "thread": None,
             "rebase_requested": d.get("rebase_requested", False),
             "saved_at": d["saved_at"],
+            "last_used": last_used,
         })
         max_eid = max(max_eid, d["eid"])
     chains = state.get("chains", [])
@@ -734,7 +764,46 @@ def _load_state():
                     _thread_chains[mid] = chains[i]
                     n_anchors += 1
     log.info(f"[STORE] Restored {len(loaded)} compression(s) and {n_anchors} "
-             f"thread anchor(s) from {STORE_PATH}")
+             f"thread anchor(s) from {STORE_PATH}"
+             + (f"; {expired} unused past retention dropped" if expired else ""))
+
+
+def _last_used(entry: dict) -> float:
+    return entry.get("last_used") or entry.get("saved_at") or time.time()
+
+
+def _prune_expired(now=None) -> int:
+    """Drop ready compressions unused for longer than the retention setting.
+
+    Only finished ones: an entry still compressing or waiting to be promoted
+    is left alone. Returns how many were dropped.
+    """
+    label, keep_for = switch.retention()
+    if keep_for is None:
+        return 0
+    now = time.time() if now is None else now
+    with store._lock:
+        stale = [e for e in store._compressions
+                 if e.get("prefix") is not None and e.get("pending") is None
+                 and not (e.get("thread") is not None and e["thread"].is_alive())
+                 and now - _last_used(e) > keep_for]
+        if stale:
+            store._compressions = [e for e in store._compressions
+                                   if not any(e is x for x in stale)]
+    if stale:
+        log.info(f"[STORE] Deleted {len(stale)} compression(s) unused for over "
+                 f"{label} ({len(store.compressions)} kept)")
+        _persist_soon()
+    return len(stale)
+
+
+def _prune_loop():
+    while True:
+        time.sleep(_PRUNE_INTERVAL)
+        try:
+            _prune_expired()
+        except Exception as e:
+            log.warning(f"[STORE] Retention sweep failed: {e}")
 
 
 def _usable_compression(convo_key):
@@ -893,7 +962,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         normalized_path = parsed.path
         if normalized_path == "/health":
-            self._handle_health()
+            self._handle_health(parse_qs(parsed.query).get("session", [""])[0])
         elif normalized_path == "/debug/compressions":
             self._handle_debug_compressions()
         elif normalized_path == "/lean/status":
@@ -976,7 +1045,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_health(self):
+    def _handle_health(self, session_id=""):
+        _refresh_limits()
         active = sum(
             1 for e in store.compressions
             if e["thread"] is not None and e["thread"].is_alive()
@@ -996,6 +1066,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "default_enabled": switch.config_default_enabled(),
             "trigger_tokens": TRIGGER_TOKENS,
             "target_tokens": TARGET_TOKENS,
+            "retention": switch.retention()[0],
             "summarizer_model": SUMMARIZER_MODEL or "(session model)",
             "summarizer_mode": "native" if NATIVE_MODE else f"flattened/{SUMMARIZER_FORMAT}",
             "upstream_url": UPSTREAM_URL,
@@ -1009,6 +1080,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "draining": _draining,
             "cache_integrity": dict(_cache_stats),
         }
+        if session_id:
+            # What this session's next request would do, for /rc and the
+            # status line: same precedence as _handle_messages.
+            if switch.is_disabled():
+                on, why = False, "machine-wide"
+            else:
+                state = switch.session_disabled(session_id)
+                why = "this session"
+                if state is None:
+                    state = session_toggles.get(session_id)
+                if state is None:
+                    state, why = not switch.config_default_enabled(), "default"
+                on = not state
+            data["session"] = {"enabled": on, "scope": why}
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -1017,6 +1102,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_messages(self):
+        _refresh_limits()
         raw_body = self._read_body()
         req_headers = self._get_headers_dict()
         auth_headers = get_passthrough_headers(req_headers)
@@ -1074,12 +1160,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
 
         # Precedence: env kill-switch, then an explicit machine-wide off, then
-        # this session's own setting, then the configured default.
+        # this session's own setting (its state file, written by /rc or
+        # /rolling-context:on|off, before any legacy marker), then the
+        # configured default.
         if switch.is_disabled():
             disabled, scope = True, "machine-wide"
         else:
-            session_state = marker_state
+            session_state = switch.session_disabled(session_id)
             scope = "this session"
+            if session_state is None:
+                session_state = marker_state
             if session_state is None:
                 session_state = session_toggles.get(session_id)
                 scope = "inherited from this session"
@@ -1100,6 +1190,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 entry["original_hashes"] = entry["pending_hashes"]
                 entry["pending"] = None
                 entry["pending_hashes"] = None
+                entry["last_used"] = time.time()
                 _persist_soon()
                 log.info(
                     f"[MSG] Compression promoted: {len(entry['prefix'])} prefix messages "
@@ -1169,6 +1260,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 payload["messages"] = merged
                 msg_chars = merged_chars
                 injected = True
+                match["last_used"] = time.time()
                 global _last_injection_ts
                 _last_injection_ts = time.time()
             else:
@@ -1537,8 +1629,14 @@ def main():
     log.info(f"  Compacting via: {SUMMARIZER_BASE_URL}"
              f"{' (third-party — flattened fallback armed)' if NATIVE_FALLBACK else ''}")
     log.info(f"  Matching: content-based (no sessions/fingerprints)")
+    label = switch.retention()[0]
+    log.info(f"  Unused compressions deleted after: {label} (set in /config)")
     _load_state()
     threading.Thread(target=_persist_loop, name="store-saver", daemon=True).start()
+    threading.Thread(target=_prune_loop, name="store-pruner", daemon=True).start()
+    swept = switch.prune_session_files()
+    if swept:
+        log.info(f"  Removed {swept} stale per-session state file(s)")
 
     try:
         server = ThreadedHTTPServer(("127.0.0.1", LISTEN_PORT), ProxyHandler)

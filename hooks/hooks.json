@@ -1,5 +1,8 @@
 {
   "description": "Rolling Context - auto-start proxy on session start",
+  "modules": [
+    "./register.ts"
+  ],
   "hooks": {
     "SessionStart": [
       {

@@ -17,17 +17,21 @@ take effect — useless at the moment you actually want it, which is mid-session
 The global scope is a flag file the proxy checks on every request instead, so
 it applies to the very next request.
 
-The session scope carries no state at all. This command prints a marker; slash
-command output is inserted into the transcript inside <local-command-stdout>,
-so from then on every request in this conversation carries it, and the proxy
-reads the newest marker to decide. That keeps the proxy's founding property
-intact — no sessions, no fingerprints, just content recognition — and means a
-session that is closed and resumed keeps whatever it was set to, for free.
+The session scope is a small state file per Claude Code session id, under
+<flag dir>/sessions/. Claude Code sends that id on every request as
+X-Claude-Code-Session-Id (subagents inherit their parent's), and exports it to
+the commands it runs as CLAUDE_CODE_SESSION_ID, so the slash command and the
+proxy agree on it without tracking anything else. A session that is closed and
+resumed keeps its id, and so keeps whatever it was set to.
 
-Scanning is confined to <local-command-stdout> blocks precisely so that reading
-this file in a conversation does not toggle anything: a Read tool result is not
-wrapped in that tag. `status` deliberately never prints the marker literals,
-for the same reason.
+It used to be a marker printed into the transcript and recognised by content.
+That never reached the transcript the way it was meant to — a prompt-style
+slash command's output arrives as a Bash tool result, not inside
+<local-command-stdout> — and it could fire by accident when a tool result
+merely quoted the marker between two such tags. The marker is still printed
+when no session id is available (a Claude Code too old to export one), and
+the proxy still honours it in real command output, but a state file wins.
+`status` deliberately never prints the marker literals.
 
 Turning off is NOT destructive in either scope. Stored compressions stay in the
 proxy's memory untouched; they simply stop being injected, and no new
@@ -40,15 +44,42 @@ dir: slash commands run through Bash, which does not inherit CLAUDE_PLUGIN_DATA,
 so a data-dir flag would be written somewhere the proxy never looks. A fixed
 path also survives version bumps, which move the plugin cache directory.
 
-  python switch.py on|off [--global] | status
+Also here: the options set in /config (the plugin's userConfig), which the
+proxy reads live from ~/.claude/settings.json so a change applies from the
+next request without a restart.
+
+  python switch.py on|off [--global] [--session ID] | status [--session ID]
 """
 import json
 import os
+import re
 import sys
+import time
 
 # Kept in one place; server.py imports these rather than restating them.
 MARKER_OFF = "<<rolling-context:session-off>>"
 MARKER_ON = "<<rolling-context:session-on>>"
+
+PLUGIN_NAME = "rolling-context"
+
+# The /config dropdown for how long an unused compression is kept. Keys must
+# match the "options" list in .claude-plugin/plugin.json exactly.
+RETENTION_CHOICES = {
+    "1 hour": 3600,
+    "6 hours": 6 * 3600,
+    "1 day": 86400,
+    "3 days": 3 * 86400,
+    "7 days": 7 * 86400,
+    "14 days": 14 * 86400,
+    "30 days": 30 * 86400,
+    "Never": None,
+}
+DEFAULT_RETENTION = "14 days"
+DEFAULT_TRIGGER = 100000
+DEFAULT_TARGET = 40000
+
+# Session state files nobody has touched in this long are swept on proxy start.
+SESSION_FILE_MAX_AGE = 90 * 86400
 
 
 def flag_dir():
@@ -113,6 +144,155 @@ def config_default_enabled():
     return value if isinstance(value, bool) else True
 
 
+# --- options set in /config (userConfig) -------------------------------------
+# Claude Code stores them in ~/.claude/settings.json as
+# pluginConfigs["<plugin>@<marketplace>"].options. One proxy serves every
+# session, so it reads them from there on each request (cached on the file's
+# mtime) rather than from the environment it happened to be started with.
+
+_options_cache = {"key": None, "value": {}}
+
+
+def claude_settings_path():
+    return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+
+
+def plugin_options():
+    """This plugin's /config values, or {} when none are stored."""
+    path = claude_settings_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    if _options_cache["key"] == key:
+        return _options_cache["value"]
+    value = {}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            settings = json.load(f)
+        configs = settings.get("pluginConfigs") or {}
+        enabled = settings.get("enabledPlugins") or {}
+        ids = [i for i in configs
+               if i == PLUGIN_NAME or i.startswith(PLUGIN_NAME + "@")]
+        # Installed from two marketplaces (say, upstream and a fork): the
+        # enabled one is the one whose /config rows the user sees.
+        ids.sort(key=lambda i: (enabled.get(i) is not True, i))
+        for i in ids:
+            opts = (configs.get(i) or {}).get("options")
+            if isinstance(opts, dict):
+                value = opts
+                break
+    except (OSError, ValueError, AttributeError):
+        value = {}
+    _options_cache.update(key=key, value=value)
+    return value
+
+
+def _int_option(name, env, default, minimum):
+    """(value, source): /config first, then the environment, then the default."""
+    v = plugin_options().get(name)
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= minimum:
+        return int(v), "/config"
+    raw = os.environ.get(env)
+    if raw:
+        try:
+            if int(raw) >= minimum:
+                return int(raw), env
+        except ValueError:
+            pass
+    return default, "default"
+
+
+def trigger_tokens():
+    return _int_option("trigger_tokens", "ROLLING_CONTEXT_TRIGGER", DEFAULT_TRIGGER, 1000)
+
+
+def target_tokens():
+    """Never at or above the trigger: that would re-trigger on every turn."""
+    target, source = _int_option("target_tokens", "ROLLING_CONTEXT_TARGET", DEFAULT_TARGET, 1000)
+    trigger = trigger_tokens()[0]
+    if target >= trigger:
+        return int(trigger * 0.5), source + " (capped at half the trigger)"
+    return target, source
+
+
+def retention():
+    """(label, seconds or None for never): how long an unused compression is kept."""
+    v = plugin_options().get("retention")
+    if v in RETENTION_CHOICES:
+        return v, RETENTION_CHOICES[v]
+    return DEFAULT_RETENTION, RETENTION_CHOICES[DEFAULT_RETENTION]
+
+
+# --- per-session state --------------------------------------------------------
+
+def sessions_dir():
+    return os.path.join(flag_dir(), "sessions")
+
+
+def _session_file(session_id):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", session_id or "")[:128]
+    return os.path.join(sessions_dir(), safe + ".json") if safe else None
+
+
+def set_session(session_id, disabled):
+    path = _session_file(session_id)
+    if not path:
+        return False
+    os.makedirs(sessions_dir(), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"disabled": bool(disabled), "at": time.time()}, f)
+    os.replace(tmp, path)
+    return True
+
+
+_session_cache = {}
+
+
+def session_disabled(session_id):
+    """True (off), False (on), or None when this session never chose."""
+    path = _session_file(session_id)
+    if not path:
+        return None
+    try:
+        mtime = os.stat(path).st_mtime_ns
+    except OSError:
+        _session_cache.pop(path, None)
+        return None
+    cached = _session_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = bool(json.load(f).get("disabled"))
+    except (OSError, ValueError, AttributeError):
+        return None
+    if len(_session_cache) > 1024:
+        _session_cache.clear()
+    _session_cache[path] = (mtime, value)
+    return value
+
+
+def prune_session_files(max_age=SESSION_FILE_MAX_AGE):
+    cutoff = time.time() - max_age
+    try:
+        names = os.listdir(sessions_dir())
+    except OSError:
+        return 0
+    removed = 0
+    for name in names:
+        path = os.path.join(sessions_dir(), name)
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def env_disabled():
     return os.environ.get("ROLLING_CONTEXT_DISABLE") == "1"
 
@@ -144,16 +324,52 @@ def _set(disabled):
             pass
 
 
-def _session(marker, lines):
-    print(marker)
+def _cmd(action, is_global=False):
+    """How to spell a command in a hint: the mod's /rc, or the plugin's own."""
+    flag = " --global" if is_global else ""
+    if os.environ.get("ROLLING_CONTEXT_VIA") == "mod":
+        return f"/rc {action}{flag}"
+    return f"/rolling-context:{action}{flag}"
+
+
+def _session(session_id, disabled, lines):
+    """Record this session's choice; the marker only when there is no id."""
+    if not set_session(session_id, disabled):
+        print(MARKER_OFF if disabled else MARKER_ON)
     for line in lines:
         print(line)
 
 
+def _parse(args):
+    session_id = None
+    rest = []
+    it = iter(args)
+    for a in it:
+        if a == "--session":
+            session_id = next(it, None)
+        elif a.startswith("--session="):
+            session_id = a.split("=", 1)[1]
+        else:
+            rest.append(a.lower())
+    if not session_id:
+        session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+    is_global = bool({"--global", "-g"} & set(rest))
+    action = next((a for a in rest if not a.startswith("-")), "status")
+    return action, is_global, session_id
+
+
+def _fmt_seconds(seconds):
+    if seconds is None:
+        return "never"
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            n = round(seconds / size)
+            return f"{n} {unit}{'' if n == 1 else 's'}"
+    return f"{int(seconds)} seconds"
+
+
 def main():
-    argv = [a.lower() for a in sys.argv[1:]]
-    is_global = bool({"--global", "-g"} & set(argv))
-    action = next((a for a in argv if not a.startswith("-")), "status")
+    action, is_global, session_id = _parse(sys.argv[1:])
 
     if action == "off":
         if is_global:
@@ -162,14 +378,14 @@ def main():
             print("its full history upstream, uncompressed.")
             print("Applies from the next request; no restart needed.")
             print("Already-computed compressions are kept, not discarded.")
-            print("Turn it back on with /rolling-context:on --global")
+            print(f"Turn it back on with {_cmd('on', True)}")
             return
-        _session(MARKER_OFF, [
+        _session(session_id, True, [
             "rolling-context is now OFF for this conversation — it will send its",
             "full history upstream, uncompressed. Other sessions are unaffected.",
             "Applies from the next request; no restart needed.",
             "Already-computed compressions are kept, not discarded.",
-            "Turn it back on with /rolling-context:on",
+            f"Turn it back on with {_cmd('on')}",
         ])
         return
 
@@ -194,32 +410,43 @@ def main():
             notes += [
                 "",
                 "Note: it is still off machine-wide, which wins over this session.",
-                "Clear that with /rolling-context:on --global",
+                f"Clear that with {_cmd('on', True)}",
             ]
-        _session(MARKER_ON, notes)
+        _session(session_id, False, notes)
         return
 
     if action == "status":
-        # Never print the marker literals here — this output lands in the
-        # transcript inside <local-command-stdout>, which is exactly what the
-        # proxy scans, so a chatty status would toggle the session it reports on.
+        # Never print the marker literals here: a transcript that quotes them
+        # is exactly what the legacy marker scan looks for.
         print(proxy_line())
+        machine_off = True
         if env_disabled():
             print("rolling-context: OFF machine-wide (ROLLING_CONTEXT_DISABLE=1 in the environment)")
         elif os.path.exists(flag_path()):
-            print("rolling-context: OFF machine-wide (switched off with /rolling-context:off --global)")
-            print(f"  flag: {flag_path()}")
+            print(f"rolling-context: OFF machine-wide (switched off with {_cmd('off', True)})")
         else:
+            machine_off = False
             print("rolling-context: ON machine-wide")
         default_on = config_default_enabled()
         print(f"  default for new sessions: {'ON' if default_on else 'OFF'}"
               + ("" if os.path.exists(config_path()) else "  (built-in)"))
-        print(f"  config: {config_path()}")
-        print("")
-        print("Per-session state is carried in the conversation itself, so it is not")
-        print("readable from here. Whichever of /rolling-context:off or")
-        print("/rolling-context:on you ran last in this session is the one in effect;")
-        print("if you have run neither, this session follows the machine-wide state.")
+        mine = session_disabled(session_id) if session_id else None
+        if not session_id:
+            print("this session: unknown (no session id; run it from a Claude Code session)")
+        elif machine_off:
+            print("this session: OFF (machine-wide wins)")
+        elif mine is None:
+            print(f"this session: {'ON' if default_on else 'OFF'} (default; never toggled here)")
+        else:
+            print(f"this session: {'OFF' if mine else 'ON'} (set with {_cmd('off' if mine else 'on')})")
+        trigger, trigger_src = trigger_tokens()
+        target, target_src = target_tokens()
+        label, seconds = retention()
+        print(f"compress above: {trigger:,} tokens ({trigger_src})")
+        print(f"keep verbatim:  {target:,} tokens ({target_src})")
+        print(f"delete unused compressions after: {label}"
+              + ("" if "retention" in plugin_options() else " (default)"))
+        print("change these in /config")
         return
 
     print(f"Unknown action {action!r} — expected on, off, or status")
