@@ -15,7 +15,7 @@ type Run = { argv: readonly string[]; env: Record<string, string> }
 const SESSION_HEALTH = { enabled: false, scope: 'this session', compressions: 3, tokens_saved: 393_580 }
 function world(
   on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false,
-  tokens: number | null = 302_500, session: object = SESSION_HEALTH,
+  tokens: number | null = 302_500, session: object = SESSION_HEALTH, active = 0,
 ) {
   const runs: Run[] = []
   const statuses: (string | undefined)[] = []
@@ -41,7 +41,7 @@ function world(
       status: 200, ok: true, headers: {},
       text: JSON.stringify({
         service: 'rolling-context', enabled: true, total_tokens_saved: 4_700_000,
-        stored_compressions: 40, active_compressions: 0,
+        stored_compressions: 40, active_compressions: active,
         session,
       }),
     },
@@ -457,5 +457,11 @@ describe('the session\'s own compressions', () => {
     const w = world(on, 'Linux', 'ok', false, 40_000, { enabled: true, scope: 'default' })
     await $.command.run({ command: 'roll', args: 'status' })
     expect(w.statuses.at(-1)).toBe('on · 40k context · 40 stored')
+  })
+
+  test('while compressing, that replaces the state and context', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, 40_000, SESSION_HEALTH, 1)
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('compressing… · 3 compressions, 394k tokens saved, 40 stored')
   })
 })

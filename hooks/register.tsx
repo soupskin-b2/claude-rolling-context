@@ -133,8 +133,11 @@ function statusText(h: Health | null | undefined, ctx: number | null) {
     : h.session?.scope === 'machine-wide'
       ? 'off machine-wide'
       : 'off for this session'
-  const context = ctx == null ? '' : ` · ${compactCtx(ctx)} context`
-  const busy = h.active_compressions ? ' · compressing…' : ''
+  // While a compression runs it takes the state and context's place: tacked
+  // on the end, the line ran past the width the host gives it and was cut.
+  const head = h.active_compressions
+    ? 'compressing…'
+    : ctx == null ? state : `${state} · ${compactCtx(ctx)} context`
   // This session's compressions and savings, then what the proxy keeps for
   // every session. A proxy older than 1.14.9 counts no session's share.
   const mine = h.session?.compressions == null ? [] : [
@@ -142,7 +145,7 @@ function statusText(h: Health | null | undefined, ctx: number | null) {
     `${compact(h.session.tokens_saved ?? 0)} tokens saved`,
   ]
   const counts = [...mine, `${h.stored_compressions ?? 0} stored`].join(', ')
-  return `${state}${context} · ${counts}${busy}`
+  return `${head} · ${counts}`
 }
 
 // Drop the legacy marker lines: machinery, not output.

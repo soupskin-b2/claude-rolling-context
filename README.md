@@ -247,6 +247,13 @@ stores for all sessions (turn it off in `/config`):
 on · 182.4k context · 2 compressions, 394k tokens saved, 40 stored
 ```
 
+While a compression runs, `compressing…` takes the place of the state and
+context, so the line stays short enough not to be cut off:
+
+```
+compressing… · 2 compressions, 394k tokens saved, 40 stored
+```
+
 `/roll` is the plugin's only command, and needs a host that loads mods (the
 CLI and the desktop app's Code tab, Claude Code 2.1.287+). The older
 `/rolling-context:status|on|off|restart` commands were removed in 1.14.9.
