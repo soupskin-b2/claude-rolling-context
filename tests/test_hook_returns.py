@@ -10,6 +10,8 @@ platform's hook the same way, in a throwaway home on free ports, and times it.
 
   A. cold start  - hook returns promptly, proxy serves, its log file is written
   B. forced restart (handover) - returns promptly, a new process serves
+  C. two hooks at once, then a forced restart - they run one at a time, the
+     restart replaces the proxy, and one proxy is left
 
   python tests/test_hook_returns.py
 """
@@ -46,6 +48,18 @@ def health(port):
             return json.loads(r.read())
     except Exception:  # noqa: BLE001
         return None
+
+
+def _alive(pid):
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                             capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def run_hook(env):
@@ -98,6 +112,38 @@ def main():
               (h2 or {}).get("pid"))
         if h2:
             pids.add(h2["pid"])
+
+        # Two sessions starting together each run the hook. Unserialized, both
+        # replaced the proxy and both started one; the second kept retrying the
+        # port, took it when the next restart drained the first, and that
+        # restart logged "could not be stopped" with the wrong proxy serving.
+        print("C. two hooks at once, then a forced restart")
+        hook_log = os.path.join(home, ".claude", "rolling-context-hook.log")
+        before = os.path.getsize(hook_log)
+        procs = [subprocess.Popen(hook_argv(), env=dict(env, ROLLING_CONTEXT_FORCE_RESTART="1"),
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL) for _ in range(2)]
+        for p in procs:
+            p.wait(timeout=60)
+        h3 = health(port)
+        run_hook(dict(env, ROLLING_CONTEXT_FORCE_RESTART="1"))
+        h4 = health(port)
+        with open(hook_log, encoding="utf-8-sig", errors="replace") as f:
+            f.seek(before)
+            tail = f.read()
+        started = {int(w) for line in tail.splitlines() if "Proxy started with PID" in line
+                   for w in line.split() if w.isdigit()}
+        pids |= started
+        time.sleep(1)  # the drained ones finish exiting
+        alive = sorted(pid for pid in started if _alive(pid))
+        check(results, "the hooks ran one at a time (no restart lost to a racing proxy)",
+              "could not be stopped" not in tail,
+              next((l for l in tail.splitlines() if "could not be stopped" in l), ""))
+        check(results, "the restart after them put a new process on the port",
+              bool(h4) and h4.get("pid") != (h3 or {}).get("pid"),
+              f"{(h3 or {}).get('pid')} -> {(h4 or {}).get('pid')}")
+        check(results, "one proxy left running",
+              alive == [(h4 or {}).get("pid")], f"alive: {alive}")
     finally:
         for pid in pids:
             try:

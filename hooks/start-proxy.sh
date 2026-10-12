@@ -70,7 +70,28 @@ _sync_wiring() {
         log "GUARD: MITM front-end is not reachable on :$MITM_PORT (or CA missing) - removed HTTPS_PROXY wiring so Claude Code connects directly instead of to a dead port. Check rolling-context-proxy.log (is 'cryptography' installed?)."
     fi
 }
-trap _sync_wiring EXIT
+
+# One hook at a time. Sessions that start together each run this hook; two
+# that both found an older proxy both drained it and both started a new one,
+# and the second kept retrying the port and took it over when the first was
+# next restarted, which that restart then reported as "could not be stopped".
+# mkdir is atomic everywhere (flock is not on macOS). A lock older than 60s is
+# a hook that died holding it. Bounded below the hook's 30s timeout: past it,
+# go on as before.
+LOCKDIR="$HOME/.claude/rolling-context-start-$PORT.lock"
+HOLDS_LOCK=false
+_release_lock() { [ "$HOLDS_LOCK" = true ] && rmdir "$LOCKDIR" 2>/dev/null; HOLDS_LOCK=false; }
+SECONDS=0
+while [ "$SECONDS" -lt 20 ]; do
+    if mkdir "$LOCKDIR" 2>/dev/null; then HOLDS_LOCK=true; break; fi
+    if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+        rmdir "$LOCKDIR" 2>/dev/null
+        continue
+    fi
+    sleep 0.25
+done
+[ "$HOLDS_LOCK" = true ] || log "Another session's start hook held the start lock for 20s; going on without it"
+trap '_sync_wiring; _release_lock' EXIT
 
 # Check if proxy is already running
 _kill_pid() {
@@ -172,6 +193,8 @@ _request_drain() {
 
 _replace_running_proxy() {
     # $1 = wait: too old to hand over, so give it a short wait for idle first.
+    local old_pid now_pid state
+    old_pid=$(_probe_pid 0.5)
     if _request_drain; then
         log "Proxy is handing over: it stopped listening and finishes its open requests on its own"
         # It may hold the ports a moment longer while it saves the store:
@@ -192,8 +215,19 @@ _replace_running_proxy() {
         case "$(_probe 0.5)" in ours*) ;; *) return 0 ;; esac
         sleep 0.25
     done
-    case "$(_probe 0.5)" in
+    state=$(_probe 0.5)
+    case "$state" in
         ours*)
+            # A different process on the port is not the old proxy refusing
+            # to go: it is a successor (one another hook started, retrying
+            # the bind) that took the port the moment the old one let go.
+            now_pid=$(_probe_pid 0.5)
+            if [ -n "$now_pid" ] && [ -n "$old_pid" ] && [ "$now_pid" != "$old_pid" ]; then
+                printf '%s' "$now_pid" > "$PIDFILE"
+                printf '%s' "${state#ours }" > "$VERFILE"
+                log "Proxy handed over to PID $now_pid (v${state#ours }), started by another session's hook; using it"
+                exit 0
+            fi
             log "ERROR: the old proxy is still serving on :$PORT and could not be stopped — not starting a second one."
             exit 0
             ;;

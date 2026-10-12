@@ -91,6 +91,20 @@ function Sync-Wiring {
     }
 }
 
+# One hook at a time. Sessions that start together each run this hook; two
+# that both found an older proxy both drained it and both started a new one,
+# and the second kept retrying the port and took it over when the first was
+# next restarted, which that restart then reported as "could not be stopped".
+# Bounded below the hook's 30s timeout: past it, go on as before.
+$StartLock = New-Object System.Threading.Mutex($false, "Local\rolling-context-start-$Port")
+$HoldsLock = $false
+try {
+    $HoldsLock = $StartLock.WaitOne(20000)
+} catch [System.Threading.AbandonedMutexException] {
+    $HoldsLock = $true   # a hook that died holding it; ours now
+}
+if (-not $HoldsLock) { Log "Another session's start hook held the start lock for 20s; going on without it" }
+
 try {
 
 # --- Is the proxy actually SERVING? ------------------------------------------
@@ -170,6 +184,7 @@ function Request-Drain {
 }
 
 function Replace-RunningProxy([switch]$WaitForIdle) {
+    $oldPid = Get-ProxyPid "0.5"
     if (Request-Drain) {
         Log "Proxy is handing over: it stopped listening and finishes its open requests on its own"
         # It may hold the ports a moment longer while it saves the store: tell
@@ -191,7 +206,18 @@ function Replace-RunningProxy([switch]$WaitForIdle) {
     while ((Get-Date) -lt $deadline -and (Get-ProxyState "0.5") -like "ours *") {
         Start-Sleep -Milliseconds 250
     }
-    if ((Get-ProxyState "0.5") -like "ours *") {
+    $state = Get-ProxyState "0.5"
+    if ($state -like "ours *") {
+        # A different process on the port is not the old proxy refusing to go:
+        # it is a successor (one another hook started, retrying the bind) that
+        # took the port the moment the old one let go. It serves; use it.
+        $nowPid = Get-ProxyPid "0.5"
+        if ($nowPid -and $oldPid -and $nowPid -ne $oldPid) {
+            $nowPid | Out-File -FilePath $PidFile -NoNewline
+            $state.Substring(5) | Out-File -FilePath $VerFile -NoNewline
+            Log "Proxy handed over to PID $nowPid (v$($state.Substring(5))), started by another session's hook; using it"
+            exit 0
+        }
         Log "ERROR: the old proxy is still serving on :$Port and could not be stopped — not starting a second one."
         exit 0
     }
@@ -299,4 +325,6 @@ exit 0
 
 } finally {
     Sync-Wiring
+    if ($HoldsLock) { $StartLock.ReleaseMutex() }
+    $StartLock.Dispose()
 }
