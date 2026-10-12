@@ -207,8 +207,12 @@ def post(port, msgs, session_id=None):
         r.read()
 
 
-def health(port):
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as r:
+B_SESSION = "sess-beta"
+
+
+def health(port, session_id=None):
+    query = f"?session={session_id}" if session_id else ""
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health{query}", timeout=10) as r:
         return json.loads(r.read())
 
 
@@ -401,7 +405,7 @@ def session_scope(root):
         b1 = conversation(24, "beta turn one")
         b1[0] = {"role": "user", "content": "beta divergence " + "z" * 400}
         post(proxy_port, a1)
-        post(proxy_port, b1)
+        post(proxy_port, b1, session_id=B_SESSION)
         time.sleep(6)  # let B's compaction land
 
         a2 = a1 + [{"role": "assistant", "content": "ok"},
@@ -409,10 +413,12 @@ def session_scope(root):
         b2 = b1 + [{"role": "assistant", "content": "ok"},
                    {"role": "user", "content": "beta turn two"}]
         post(proxy_port, a2)
-        post(proxy_port, b2)
+        post(proxy_port, b2, session_id=B_SESSION)
         time.sleep(1)
         h = health(proxy_port)
         stored_mid = h.get("stored_compressions", 0)
+        b_counted = health(proxy_port, B_SESSION).get("session", {})
+        other_counted = health(proxy_port, "never-seen").get("session", {})
 
         # A opts back in; the compression stored for A's history is reusable
         # because <local-command-stdout> is stripped before hashing.
@@ -453,6 +459,12 @@ def session_scope(root):
           f"{b2_req['convo_chars']:,} chars sent vs {len(json.dumps(b2)):,} held")
     check(results, "A opting out never blocked B's compression",
           stored_mid >= 1, f"{stored_mid} compression(s) stored")
+    check(results, "/health?session= counts B's compression and its savings",
+          b_counted.get("compressions", 0) >= 1 and b_counted.get("tokens_saved", 0) > 0,
+          str(b_counted))
+    check(results, "a session the proxy never compressed counts none",
+          other_counted.get("compressions") == 0 and other_counted.get("tokens_saved") == 0,
+          str(other_counted))
     check(results, "session A opting back in is compressed again",
           a4_req["carries_summary"]
           and a4_req["convo_chars"] < len(json.dumps(a4)) * 0.75,
@@ -630,7 +642,8 @@ def session_files(root):
                 f"http://127.0.0.1:{proxy_port}/health?session={PARENT}", timeout=10) as r:
             h = json.loads(r.read())
         check(results, "/health?session= reports the session as off",
-              h.get("session") == {"enabled": False, "scope": "this session"}, str(h.get("session")))
+              {k: h.get("session", {}).get(k) for k in ("enabled", "scope")}
+              == {"enabled": False, "scope": "this session"}, str(h.get("session")))
 
         p1 = conversation(24, "parent turn one")
         post(proxy_port, p1, session_id=PARENT)

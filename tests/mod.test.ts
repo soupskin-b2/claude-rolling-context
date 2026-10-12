@@ -10,8 +10,13 @@ type Run = { argv: readonly string[]; env: Record<string, string> }
 
 // hangFetch: /health never answers, as a fetch through a proxy that cannot
 // relay it did. tokens: the context tokens $.session.usage reports, or null
-// for an engine that reports none.
-function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false, tokens: number | null = 302_500) {
+// for an engine that reports none. session: /health's answer for this
+// session (a proxy before 1.14.9 counts no compressions there).
+const SESSION_HEALTH = { enabled: false, scope: 'this session', compressions: 3, tokens_saved: 393_580 }
+function world(
+  on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false,
+  tokens: number | null = 302_500, session: object = SESSION_HEALTH,
+) {
   const runs: Run[] = []
   const statuses: (string | undefined)[] = []
   mock.env(on, os === 'Windows_NT'
@@ -37,7 +42,7 @@ function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = f
       text: JSON.stringify({
         service: 'rolling-context', enabled: true, total_tokens_saved: 4_700_000,
         stored_compressions: 40, active_compressions: 0,
-        session: { enabled: false, scope: 'this session' },
+        session,
       }),
     },
   }))
@@ -57,7 +62,6 @@ describe('/roll', () => {
     expect(run.argv[0]).toBe('python3')
     expect(run.argv.slice(2)).toEqual(['off', '--session', SESSION])
     expect(run.argv[1]).toMatch(/proxy\/switch\.py$/)
-    expect(run.env.ROLLING_CONTEXT_VIA).toBe('mod')
   })
 
   test('uses python on Windows and passes --global through', async ($, on) => {
@@ -92,41 +96,35 @@ describe('/roll', () => {
   test('the status line shows this session\'s state after a toggle', async ($, on) => {
     const w = world(on, 'Linux', 'ok')
     await $.command.run({ command: 'roll', args: 'off' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 3 compressions, 394k tokens saved, 40 stored')
   })
-})
-
-test('the plugin\'s own /rolling-context:off is answered without a Claude turn', async ($, on) => {
-  const w = world(on, 'Linux', 'rolling-context is now OFF')
-  const { text } = await $.command.run({ command: 'rolling-context:off', args: '' })
-  expect(text).toBe('rolling-context is now OFF')
-  expect(w.runs.at(-1)!.argv.slice(2)).toEqual(['off', '--session', SESSION])
 })
 
 describe('registration', () => {
-  // What the menu shows for the plugin's own /rolling-context:status.
-  async function legacyHidden($: Parameters<Parameters<typeof test>[1]>[0], on: On) {
-    on('command.describe', async ($, e) => ({ description: e.description, isHidden: e.isHidden }))
+  test('/roll is the one command the plugin registers', async ($, on) => {
+    world(on, 'Linux', '')
+    const names: string[] = []
+    on('command.register', async ($, e) => {
+      names.push(e.name)
+      return { value: { command: e.name } }
+    })
     on('ui.log', async () => ({ value: undefined }))
     on('session.start', async ($, e) => e)
     await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
-    const shown = await $.command.describe({
-      command: 'rolling-context:status', description: 'status', isHidden: false,
-      immediate: false, provider: { plugin: 'rolling-context', tier: 'user' },
-    })
-    return shown.isHidden
-  }
-
-  test('/roll registers, and the .md commands are hidden in its favour', async ($, on) => {
-    world(on, 'Linux', '')
-    on('command.register', async ($, e) => ({ value: { command: e.name } }))
-    expect(await legacyHidden($, on)).toBe(true)
+    expect(names).toEqual(['roll'])
   })
 
-  test('if /roll is refused (a taken name), the .md commands stay listed', async ($, on) => {
+  test('if /roll is refused (a taken name), the log says so', async ($, on) => {
     world(on, 'Linux', '')
+    const logs: unknown[] = []
     on('command.register', async () => ({ deny: '"/roll" refused: it is taken' }))
-    expect(await legacyHidden($, on)).toBe(false)
+    on('ui.log', async ($, e) => {
+      logs.push(e)
+      return { value: undefined }
+    })
+    on('session.start', async ($, e) => e)
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    expect(JSON.stringify(logs)).toMatch(/\/roll is unavailable/)
   })
 })
 
@@ -248,13 +246,13 @@ describe('the row under the prompt', () => {
       await $.command.run({ command: 'roll', args: 'status' }) // the first /health read
       const row = await $.ui.mount({ plugin: 'rolling-context', surface, component: 'PromptHint', props: HINT })
       const status = await row.find({ type: 'Text', text: /^Rolling context: / })
-      expect(status?.text).toBe('Rolling context: off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
+      expect(status?.text).toBe('Rolling context: off for this session · 302.5k context · 3 compressions, 394k tokens saved, 40 stored')
       expect(status?.props).toMatchObject({ bold: true, color: 'text' })
       expect((await row.find({ text: '? for shortcuts' }))).toBeDefined()
       // The status line keeps the status too: the row holds the buttons, the
       // line holds the words.
       await $.command.run({ command: 'roll', args: 'status' })
-      expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
+      expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 3 compressions, 394k tokens saved, 40 stored')
 
       // The world's /health says off for this session.
       expect((await row.find({ key: 'toggle' }))?.text).toMatch(/Turn on/)
@@ -402,30 +400,45 @@ describe('context token count', () => {
   test('formats thousands with one decimal (302.5k)', async ($, on) => {
     const w = world(on, 'Linux', 'ok')
     await $.command.run({ command: 'roll', args: 'status' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 3 compressions, 394k tokens saved, 40 stored')
   })
 
   test('trims exact thousands (40k, not 40.0k)', async ($, on) => {
     const w = world(on, 'Linux', 'ok', false, 40_000)
     await $.command.run({ command: 'roll', args: 'status' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 40k context · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 40k context · 3 compressions, 394k tokens saved, 40 stored')
   })
 
   test('shows small counts plainly (999)', async ($, on) => {
     const w = world(on, 'Linux', 'ok', false, 999)
     await $.command.run({ command: 'roll', args: 'status' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 999 context · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 999 context · 3 compressions, 394k tokens saved, 40 stored')
   })
 
   test('formats millions with one decimal (2.5M)', async ($, on) => {
     const w = world(on, 'Linux', 'ok', false, 2_500_000)
     await $.command.run({ command: 'roll', args: 'status' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 2.5M context · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 2.5M context · 3 compressions, 394k tokens saved, 40 stored')
   })
 
   test('omits the segment when usage is unavailable', async ($, on) => {
     const w = world(on, 'Linux', 'ok', false, null)
     await $.command.run({ command: 'roll', args: 'status' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 3 compressions, 394k tokens saved, 40 stored')
+  })
+})
+
+describe('the session\'s own compressions', () => {
+  test('one compression reads singular', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, 40_000,
+      { enabled: true, scope: 'default', compressions: 1, tokens_saved: 120_000 })
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('on · 40k context · 1 compression, 120k tokens saved, 40 stored')
+  })
+
+  test('a proxy that counts no session\'s share shows only what it stores', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, 40_000, { enabled: true, scope: 'default' })
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('on · 40k context · 40 stored')
   })
 })

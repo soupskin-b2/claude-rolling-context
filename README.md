@@ -239,13 +239,17 @@ what you want there.
 
 `/roll` runs at once, **even while Claude is mid-turn**, and never starts a
 Claude turn: the plugin's mod runs the switch itself and prints the result.
-A status line under the prompt shows whether this session is compressing and
-what it has saved (turn it off in `/config`).
+A status line under the prompt shows this session's state and context size,
+then its compressions and tokens saved, then how many compressions the proxy
+stores for all sessions (turn it off in `/config`):
 
-The older `/rolling-context:status|on|off|restart` commands still work. Where
-mods load (the CLI and the desktop app's Code tab, Claude Code 2.1.287+), the
-mod answers them too, without a Claude turn, and hides them from the menu in
-favour of `/roll`. Elsewhere they are prompt templates Claude runs for you.
+```
+on · 182.4k context · 2 compressions, 394k tokens saved, 40 stored
+```
+
+`/roll` is the plugin's only command, and needs a host that loads mods (the
+CLI and the desktop app's Code tab, Claude Code 2.1.287+). The older
+`/rolling-context:status|on|off|restart` commands were removed in 1.14.9.
 
 Both scopes apply from the **next request** — no Claude Code restart, no proxy
 restart. Machine-wide off wins over a session that opted in.
@@ -318,7 +322,7 @@ Everything else is an environment variable (all optional — defaults work great
 | `ROLLING_CONTEXT_SUMMARIZER_FORMAT` | `anthropic` | `openai` = /v1/chat/completions for OpenAI-compatible endpoints |
 | `ROLLING_CONTEXT_FAILURE_COOLDOWN` | `300` | Seconds to wait before retrying after a failed compression |
 | `ROLLING_CONTEXT_FALLBACK_MODEL` | `claude-sonnet-5` | Model for the one retry when native compaction returns a 200 with no text (a refusal or a thinking-only answer on reasoning models) |
-| `ROLLING_CONTEXT_DISABLE` | *(unset)* | `1` = off everywhere; wins over `/rolling-context:on --global` |
+| `ROLLING_CONTEXT_DISABLE` | *(unset)* | `1` = off everywhere; wins over `/roll on --global` |
 | `ROLLING_CONTEXT_HOME` | `~/.claude-rolling-context` | Where the machine-wide off flag, the per-session state files and the saved compressions live |
 | `ROLLING_CONTEXT_MAX_CONCURRENT` | `4` | Background compactions allowed at once across all conversations. A conversation with no summary yet is admitted past this (up to 2x) rather than be starved |
 | `ROLLING_CONTEXT_LOG_LEVEL` | `INFO` | `DEBUG` for per-request match detail (verbose, and it writes conversation content to disk) |
@@ -388,7 +392,9 @@ curl http://127.0.0.1:5588/health
 ```
 
 Returns who is on the port (`service`, `version`, `pid`) and compression stats:
-how many compressions, tokens saved, etc.
+how many compressions, tokens saved, etc. With `?session=<id>` it also says
+whether that session is compressing, and its own compressions and tokens saved
+since the proxy started.
 
 This is also how the start hook decides whether to start anything. It does not
 trust the PID file: a crashed proxy leaves that file behind, and the OS is free
@@ -430,7 +436,7 @@ log). Since v1.13.2:
   field are judged by their established client sockets instead.
 - **Drain on SIGTERM.** The proxy stops accepting, finishes what is in flight
   (up to `ROLLING_CONTEXT_DRAIN_SECONDS`, default 20), then exits.
-- **`/roll restart`** (or `/rolling-context:restart`) forces a restart when you want the new version
+- **`/roll restart`** forces a restart when you want the new version
   now; it still waits briefly for in-flight requests.
 
 Plugin updates follow the pinned version in `plugin.json`: bump it with every

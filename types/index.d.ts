@@ -9,7 +9,8 @@ export type RollingContextHealth = {
   total_tokens_saved?: number
   stored_compressions?: number
   active_compressions?: number
-  session?: { enabled: boolean; scope: string }
+  /** This session's state, and (proxy 1.14.9 on) its own compressions. */
+  session?: { enabled: boolean; scope: string; compressions?: number; tokens_saved?: number }
 }
 
 /** The /config options as the settings pane shows them. */

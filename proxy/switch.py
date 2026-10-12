@@ -96,20 +96,23 @@ def config_path():
     return os.path.join(flag_dir(), "config.json")
 
 
-def proxy_line():
-    """One line on whether the proxy is actually up.
+def proxy_line(session_id=None):
+    """One line on whether the proxy is actually up, and this session's
+    compressions as the proxy counts them (None where it has no count).
 
     "rolling-context: ON" used to be printed by a status command that had
     never checked whether anything was listening — the same blind spot that
     let a crashed proxy read as running (issue #9). On is only meaningful if
     there is a proxy to be on.
     """
+    import urllib.parse
     import urllib.request
 
     port = os.environ.get("ROLLING_CONTEXT_PORT") or "5588"
+    query = f"?session={urllib.parse.quote(session_id)}" if session_id else ""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(f"http://127.0.0.1:{port}/health", timeout=2) as r:
+        with opener.open(f"http://127.0.0.1:{port}/health{query}", timeout=2) as r:
             body = json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
         # ASCII only: this prints to a terminal that may be cp1252, where an
@@ -117,12 +120,15 @@ def proxy_line():
         return (f"proxy: NOT RUNNING on port {port} - sessions will fail with "
                 f"connection refused.\n"
                 f"  It restarts on the next Claude Code session; see "
-                f"~/.claude/rolling-context-hook.log")
+                f"~/.claude/rolling-context-hook.log"), None
     if body.get("service") != "rolling-context":
-        return f"proxy: port {port} is answering, but it is not this proxy"
+        return f"proxy: port {port} is answering, but it is not this proxy", None
+    mine = body.get("session") or {}
+    counted = mine if "compressions" in mine else None
     return (f"proxy: running on port {port} (v{body.get('version', '?')}, "
             f"{body.get('compression_count', 0)} compressions, "
-            f"{body.get('total_tokens_saved', 0):,} tokens saved)")
+            f"{body.get('total_tokens_saved', 0):,} tokens saved, "
+            f"{body.get('stored_compressions', 0)} stored)"), counted
 
 
 def config_default_enabled():
@@ -316,7 +322,7 @@ def _set(disabled):
     if disabled:
         os.makedirs(flag_dir(), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            f.write("rolling-context disabled via /rolling-context:off --global\n")
+            f.write("rolling-context disabled via /roll off --global\n")
     else:
         try:
             os.remove(path)
@@ -325,11 +331,9 @@ def _set(disabled):
 
 
 def _cmd(action, is_global=False):
-    """How to spell a command in a hint: the mod's /roll, or the plugin's own."""
+    """How to spell a command in a hint: /roll, the plugin's only command."""
     flag = " --global" if is_global else ""
-    if os.environ.get("ROLLING_CONTEXT_VIA") == "mod":
-        return f"/roll {action}{flag}"
-    return f"/rolling-context:{action}{flag}"
+    return f"/roll {action}{flag}"
 
 
 def _session(session_id, disabled, lines):
@@ -418,7 +422,8 @@ def main():
     if action == "status":
         # Never print the marker literals here: a transcript that quotes them
         # is exactly what the legacy marker scan looks for.
-        print(proxy_line())
+        line, counted = proxy_line(session_id)
+        print(line)
         machine_off = True
         if env_disabled():
             print("rolling-context: OFF machine-wide (ROLLING_CONTEXT_DISABLE=1 in the environment)")
@@ -439,6 +444,9 @@ def main():
             print(f"this session: {'ON' if default_on else 'OFF'} (default; never toggled here)")
         else:
             print(f"this session: {'OFF' if mine else 'ON'} (set with {_cmd('off' if mine else 'on')})")
+        if session_id and counted is not None:
+            print(f"  this session's compressions: {counted['compressions']}, "
+                  f"{counted.get('tokens_saved', 0):,} tokens saved")
         trigger, trigger_src = trigger_tokens()
         target, target_src = target_tokens()
         label, seconds = retention()

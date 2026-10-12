@@ -29,7 +29,6 @@ import type { RollingContextHealth as Health, RollingContextSettings as Settings
 const PLUGIN = 'rolling-context'
 const ACTIONS = ['status', 'on', 'off', 'restart', 'set'] as const
 type Action = (typeof ACTIONS)[number]
-const LEGACY = ['status', 'on', 'off', 'restart'].map(a => `${PLUGIN}:${a}`)
 const STATUS_EVERY_MS = 30_000
 const USAGE =
   'Usage: /roll [status|on|off|restart] [--global], or /roll set <trigger|target|retention> <value>'
@@ -136,8 +135,14 @@ function statusText(h: Health | null | undefined, ctx: number | null) {
       : 'off for this session'
   const context = ctx == null ? '' : ` · ${compactCtx(ctx)} context`
   const busy = h.active_compressions ? ' · compressing…' : ''
-  return `${state}${context} · ${compact(h.total_tokens_saved ?? 0)} tokens saved · ` +
-    `${h.stored_compressions ?? 0} stored${busy}`
+  // This session's compressions and savings, then what the proxy keeps for
+  // every session. A proxy older than 1.14.9 counts no session's share.
+  const mine = h.session?.compressions == null ? [] : [
+    `${h.session.compressions} compression${h.session.compressions === 1 ? '' : 's'}`,
+    `${compact(h.session.tokens_saved ?? 0)} tokens saved`,
+  ]
+  const counts = [...mine, `${h.stored_compressions ?? 0} stored`].join(', ')
+  return `${state}${context} · ${counts}${busy}`
 }
 
 // Drop the legacy marker lines: machinery, not output.
@@ -151,8 +156,6 @@ const clean = (text: string) =>
 // Set from the options in register; /config changes reload the module.
 let showStatus = true
 let showControls = true
-// Whether /roll was registered: the .md commands are hidden only then.
-let rollRegistered = false
 // Whether a surface draws the row under the prompt; then the band stays
 // empty (its buttons already sit in the row).
 let rowDrawn = false
@@ -305,7 +308,7 @@ async function run($: EngineInterface, args: string): Promise<string> {
   const r = await runPython(
     $,
     [`${$.plugin.root}/proxy/switch.py`, action, ...flags, '--session', await $.session.id()],
-    { ROLLING_CONTEXT_VIA: 'mod', PYTHONIOENCODING: 'utf-8' },
+    { PYTHONIOENCODING: 'utf-8' },
   )
   await refreshStatus($)
   const out = clean(r.stdout) || clean(r.stderr)
@@ -449,10 +452,9 @@ export const register: Register = (on, options) => {
     void refreshStatus($).catch(() => {})
     $.clock.every(STATUS_EVERY_MS, () => void refreshStatus($))
     if (!showStatus) $.ui.status(undefined)
-    // A name another command already holds (a built-in or its alias, as /rc
-    // is /remote-control's) is refused with a throw. Then the plugin's own
-    // /rolling-context:* commands stay listed, and say so, rather than leave
-    // nothing in the menu.
+    // /roll is the plugin's only command. A name another command already
+    // holds (a built-in or its alias, as /rc is /remote-control's) is refused
+    // with a throw; say so, since the controls row still works without it.
     try {
       await $.command.register({
         name: 'roll',
@@ -460,30 +462,14 @@ export const register: Register = (on, options) => {
         argumentHint: '[status|on|off|restart|set <option> <value>] [--global]',
         immediate: true,
       })
-      rollRegistered = true
     } catch (err) {
-      rollRegistered = false
-      $.ui.log(`/roll is unavailable (${String(err)}); use /rolling-context:status, :on, :off and :restart instead`)
+      $.ui.log(`/roll is unavailable (${String(err)}); the controls under the prompt still work`)
     }
-    // The menu caches each command's description for the session, and may
-    // have asked before /roll existed: ask again, so the .md commands hide.
-    $.ui.invalidate('command.describe')
     return next(e)
   })
 
   on('command.run', { command: 'roll' }, async ($, e) => ({ text: await run($, e.args) }))
     .catch(failed)
-
-  // The plugin's own /rolling-context:<action> commands: answered here, so
-  // no Claude turn, and kept out of the menu in favour of /roll.
-  for (const name of LEGACY) {
-    const action = name.split(':')[1]
-    on('command.run', { command: name }, async ($, e) => ({
-      text: await run($, `${action} ${e.args}`),
-    })).catch(failed)
-    on('command.describe', { command: name }, async ($, e, next) =>
-      rollRegistered ? { ...(await next(e)), isHidden: true } : next(e))
-  }
 
   // A turn may have triggered a compression; show it without waiting 30 s.
   on('turn.complete', async ($, e, next) => {

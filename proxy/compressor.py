@@ -730,11 +730,14 @@ class RollingCompressor:
     # ------------------------------------------------------------------
 
     def compress(self, messages: list, auth_headers: dict, real_token_count: int = None,
-                 payload: dict = None) -> list:
+                 payload: dict = None, stats: dict = None) -> list:
         """Compress messages using rolling summarization (synchronous).
 
         Returns the compressed message list, or None when there is nothing
-        worth compressing (callers must not build a compression entry then)."""
+        worth compressing (callers must not build a compression entry then).
+        `stats`, when given, gets this compression's "tokens_saved": the
+        totals on self are shared by every thread, so a caller cannot read
+        its own share off them."""
         # Use real API token count to determine what fraction of content to keep
         if real_token_count and real_token_count > 0:
             keep_ratio = self.target_tokens / real_token_count
@@ -837,7 +840,7 @@ class RollingCompressor:
         if real_token_count:
             reduction = compressed_chars / original_chars if original_chars > 0 else 0
             estimated_output_tokens = int(real_token_count * reduction)
-            self.total_tokens_saved += real_token_count - estimated_output_tokens
+            saved = real_token_count - estimated_output_tokens
             log.info(
                 f"Compression #{self.compression_count}: "
                 f"~{real_token_count:,} -> ~{estimated_output_tokens:,} real tokens "
@@ -845,11 +848,14 @@ class RollingCompressor:
                 f"summary={summary_chars:,} chars, recent={recent_chars:,} chars)"
             )
         else:
-            self.total_tokens_saved += (original_chars - compressed_chars) // 2
+            saved = (original_chars - compressed_chars) // 2
             log.info(
                 f"Compression #{self.compression_count}: "
                 f"{original_chars:,} -> {compressed_chars:,} chars "
                 f"(summary={summary_chars:,}, recent={recent_chars:,})"
             )
+        self.total_tokens_saved += saved
+        if stats is not None:
+            stats["tokens_saved"] = saved
 
         return compressed

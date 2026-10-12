@@ -369,6 +369,37 @@ class SessionToggleStore:
 session_toggles = SessionToggleStore()
 
 
+class SessionStats:
+    """Compressions finished and tokens saved, per Claude Code session.
+
+    For /health?session=, which the status line reads. In memory and bounded
+    like the toggles: a proxy restart starts every session's tally at zero.
+    """
+
+    def __init__(self, limit=512):
+        self._lock = threading.Lock()
+        self._stats = OrderedDict()
+        self._limit = limit
+
+    def record(self, session_id: str, tokens_saved: int):
+        if not session_id:
+            return
+        with self._lock:
+            s = self._stats.setdefault(session_id, {"compressions": 0, "tokens_saved": 0})
+            s["compressions"] += 1
+            s["tokens_saved"] += max(0, int(tokens_saved or 0))
+            self._stats.move_to_end(session_id)
+            while len(self._stats) > self._limit:
+                self._stats.popitem(last=False)
+
+    def get(self, session_id: str) -> dict:
+        with self._lock:
+            return dict(self._stats.get(session_id) or {"compressions": 0, "tokens_saved": 0})
+
+
+session_stats = SessionStats()
+
+
 def _command_output_texts(message: dict):
     """The texts of a message that are real slash-command output.
 
@@ -930,12 +961,15 @@ def _do_background_compression(entry: dict, messages: list, auth_headers: dict,
     """Compress messages. Key = hashes of messages that were summarized (not kept verbatim)."""
     log.info(f"[BG] Starting compression of {len(messages)} messages...")
     try:
+        stats = {}
         compressed = compressor.compress(messages, auth_headers,
-                                         real_token_count=real_token_count, payload=payload)
+                                         real_token_count=real_token_count, payload=payload,
+                                         stats=stats)
         if compressed is None:
             # Nothing worth compressing — don't leave an empty entry behind
             store.remove(entry)
             return
+        session_stats.record(entry.get("session") or "", stats.get("tokens_saved", 0))
         # compressed = [summary, (carried system,) ack] + recent_verbatim
         # Prefix = ONLY the summary part — verbatim messages come from the
         # original request during injection, so including them in the prefix
@@ -1198,7 +1232,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if state is None:
                     state, why = not switch.config_default_enabled(), "default"
                 on = not state
-            data["session"] = {"enabled": on, "scope": why}
+            mine = session_stats.get(session_id)
+            data["session"] = {"enabled": on, "scope": why,
+                               "compressions": mine["compressions"],
+                               "tokens_saved": mine["tokens_saved"]}
         body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -1675,6 +1712,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                     entry = store.add()
                     entry["owner"] = convo_key
+                    entry["session"] = session_id
                     t = threading.Thread(
                         target=_do_background_compression,
                         args=(entry, current_messages, auth_headers),
