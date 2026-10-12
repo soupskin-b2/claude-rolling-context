@@ -75,6 +75,22 @@ def options():
     }, enabled={"rolling-context@nestor-plugins": False, "rolling-context@my-fork": True})
     check(switch.trigger_tokens()[0] == 222222, "the enabled install's options win")
 
+    # The desktop app: enabled as @<marketplace>, its /config rows keyed
+    # @inline. The mod records the rows' id; that entry wins over the enabled.
+    write_settings({
+        "rolling-context@soupskin-plugins": {"options": {"retention": "14 days"}},
+        "rolling-context@inline": {"options": {"retention": "3 days"}},
+    }, enabled={"rolling-context@soupskin-plugins": True})
+    check(switch.retention()[0] == "14 days", "with no id recorded, the enabled entry is read")
+    with open(switch.config_id_path(), "w", encoding="utf-8") as f:
+        f.write("rolling-context@inline\n")
+    check(switch.retention()[0] == "3 days",
+          "the entry the mod recorded wins, with settings.json unchanged")
+    with open(switch.config_id_path(), "w", encoding="utf-8") as f:
+        f.write("rolling-context@gone\n")
+    check(switch.retention()[0] == "14 days", "a recorded id with no entry falls back to the enabled one")
+    os.remove(switch.config_id_path())
+
     write_settings({"rolling-context@x": {"options": {
         "trigger_tokens": 50000, "target_tokens": 90000, "retention": "forever-ish"}}})
     check(switch.target_tokens()[0] == 25000, "a target at or above the trigger is capped at half")

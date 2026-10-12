@@ -201,6 +201,23 @@ describe('/roll set', () => {
     expect(text).toMatch(/retention set to 1 day/)
   })
 
+  test('records the rows\' pluginConfigs id for the proxy to read', async ($, on) => {
+    world(on, 'Linux', '')
+    config(on, 'rolling-context@inline', 'rolling-context')
+    const files: Record<string, string> = {}
+    on('fs.read', async ($, e) =>
+      e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' })
+    on('fs.write', async ($, e) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    await $.command.run({ command: 'roll', args: 'set retention 1 day' })
+    const [path, text] = Object.entries(files)[0] ?? []
+    // The engine hands the write a native path.
+    expect(path?.replace(/\\/g, '/')).toMatch(/\/home\/u\/\.claude\/rolling-context-config-id$/)
+    expect(text).toBe('rolling-context@inline\n')
+  })
+
   test('finds the rows by key when the provider is spelled some other way', async ($, on) => {
     world(on, 'Linux', '')
     const sets = config(on, 'rc-renamed', 'rolling-context')

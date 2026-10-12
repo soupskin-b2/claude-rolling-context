@@ -193,8 +193,25 @@ function isOurs(row: { key: string; provider?: { plugin?: string } }) {
 }
 
 async function optionRows($: EngineInterface) {
-  const rows = await $.config.list()
-  return rows.filter(isOurs)
+  const rows = (await $.config.list()).filter(isOurs)
+  await recordConfigId($, rows[0]?.provider?.plugin)
+  return rows
+}
+
+// The proxy reads the options from settings.json's pluginConfigs, which can
+// hold more than one entry for this plugin: the desktop app's rows belong to
+// `rolling-context@inline` while `@<marketplace>` is the enabled id. Tell it
+// which entry the rows the user edits are, so a save reaches the proxy.
+let recordedId = ''
+async function recordConfigId($: EngineInterface, id: string | undefined) {
+  if (!id || !ours(id) || id === recordedId) return
+  try {
+    const path = `${await home($)}/.claude/rolling-context-config-id`
+    if ((await $.fs.read(path).catch(() => '')).trim() !== id) await $.fs.write(path, `${id}\n`)
+    recordedId = id
+  } catch {
+    // The proxy falls back to the enabled id.
+  }
 }
 
 async function loadSettings($: EngineInterface) {
@@ -450,6 +467,7 @@ export const register: Register = (on, options) => {
     // Background refresh: a session that ends mid-refresh has nothing to
     // update, so a late write failing there is dropped, not reported.
     void refreshStatus($).catch(() => {})
+    void optionRows($).catch(() => {}) // records which pluginConfigs entry is live
     $.clock.every(STATUS_EVERY_MS, () => void refreshStatus($))
     if (!showStatus) $.ui.status(undefined)
     // /roll is the plugin's only command. A name another command already

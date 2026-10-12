@@ -163,6 +163,19 @@ def claude_settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
 
 
+def config_id_path():
+    """Where the mod records the pluginConfigs id its /config rows belong to."""
+    return os.path.join(os.path.expanduser("~"), ".claude", "rolling-context-config-id")
+
+
+def _config_id():
+    try:
+        with open(config_id_path(), encoding="utf-8-sig") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def plugin_options():
     """This plugin's /config values, or {} when none are stored."""
     path = claude_settings_path()
@@ -170,7 +183,8 @@ def plugin_options():
         st = os.stat(path)
     except OSError:
         return {}
-    key = (st.st_mtime_ns, st.st_size)
+    live = _config_id()
+    key = (st.st_mtime_ns, st.st_size, live)
     if _options_cache["key"] == key:
         return _options_cache["value"]
     value = {}
@@ -181,9 +195,13 @@ def plugin_options():
         enabled = settings.get("enabledPlugins") or {}
         ids = [i for i in configs
                if i == PLUGIN_NAME or i.startswith(PLUGIN_NAME + "@")]
-        # Installed from two marketplaces (say, upstream and a fork): the
-        # enabled one is the one whose /config rows the user sees.
-        ids.sort(key=lambda i: (enabled.get(i) is not True, i))
+        # The engine may key the rows the user edits otherwise than the
+        # enabled id: the desktop app loads the plugin as `<name>@inline`
+        # beside an enabled `<name>@<marketplace>`, and its /config writes
+        # the former. The mod records the id its rows carry; that one first.
+        # Without it, installed from two marketplaces (say, upstream and a
+        # fork), the enabled one is the one whose /config rows the user sees.
+        ids.sort(key=lambda i: (i != live, enabled.get(i) is not True, i))
         for i in ids:
             opts = (configs.get(i) or {}).get("options")
             if isinstance(opts, dict):
