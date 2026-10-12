@@ -130,18 +130,29 @@ def _successor_listening():
 
 
 def _plugin_version() -> str:
-    """Our version, read from the plugin manifest next to this file.
+    """Our version, read from the proxy/VERSION file next to this file.
+
+    The plugin manifest carries no pinned version, so the plugin manager
+    versions installs by commit SHA and every commit is an update with no
+    version bump. The proxy keeps its own version here instead: bump
+    proxy/VERSION, and only that file, when proxy/ code changes, so the
+    start hook restarts a stale proxy. Falls back to the manifest for
+    checkouts that still pin one.
 
     Reported on /health so the start hook can tell "the proxy is serving" from
     "the proxy is serving, but it is the version you just replaced" without
     consulting a side file that a crash can leave lying about.
     """
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        ".claude-plugin", "plugin.json",
-    )
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
-        with open(path, encoding="utf-8-sig") as f:
+        with open(os.path.join(root, "proxy", "VERSION"), encoding="utf-8-sig") as f:
+            text = f.read().strip()
+        if text:
+            return text.split()[0]
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(root, ".claude-plugin", "plugin.json"), encoding="utf-8-sig") as f:
             return str(json.load(f).get("version") or "unknown")
     except Exception:
         return "unknown"

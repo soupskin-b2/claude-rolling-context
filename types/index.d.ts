@@ -28,6 +28,8 @@ declare module 'claude-code' {
       settings: RollingContextSettings | null
       /** What the row says while a control works (a restart), else null. */
       busy: string | null
+      /** Context tokens from $.session.usage, else null. */
+      ctx: number | null
     }
   }
 }

@@ -56,6 +56,7 @@ ROOT = os.path.dirname(HERE)
 # would resolve its own directory to the cwd. Python accepts them everywhere.
 HOOK = os.path.join(ROOT, "hooks", "start-proxy.sh").replace("\\", "/")
 MANIFEST = os.path.join(ROOT, ".claude-plugin", "plugin.json")
+VERSION_FILE = os.path.join(ROOT, "proxy", "VERSION")
 
 
 def find_bash():
@@ -93,8 +94,17 @@ def free_port():
 
 
 def plugin_version():
+    """The version the plugin root's proxy reports: proxy/VERSION first,
+    then the manifest pin, matching proxy/server.py."""
+    try:
+        with open(VERSION_FILE, encoding="utf-8-sig") as f:
+            text = f.read().strip()
+        if text:
+            return text.split()[0]
+    except Exception:
+        pass
     with open(MANIFEST, encoding="utf-8-sig") as f:
-        return json.load(f)["version"]
+        return json.load(f).get("version") or "unknown"
 
 
 def health(port, timeout=0.5):
@@ -287,7 +297,7 @@ def start_proxy(home, port, plugin_root=ROOT):
 def old_version_checkout(root, version="0.0.1-old", name="old-checkout"):
     """A copy of the plugin stamped with another version.
 
-    Nothing is faked: the copy's proxy reads its own manifest and honestly
+    Nothing is faked: the copy's proxy reads its own VERSION file and honestly
     reports that version on /health, which is what an upgrade (or a newer
     sibling install) actually looks like from the hook's side.
     """
@@ -297,12 +307,17 @@ def old_version_checkout(root, version="0.0.1-old", name="old-checkout"):
         for sub in ("proxy", ".claude-plugin"):
             shutil.copytree(os.path.join(ROOT, sub), os.path.join(dst, sub),
                             ignore=shutil.ignore_patterns("venv", "__pycache__"))
+        with open(os.path.join(dst, "proxy", "VERSION"), "w", encoding="utf-8") as f:
+            f.write(version)
+        # The copy inherits no manifest pin (the manifest carries none), so
+        # drop one if an older tree still has it: the VERSION file decides.
         manifest = os.path.join(dst, ".claude-plugin", "plugin.json")
         with open(manifest, encoding="utf-8-sig") as f:
             data = json.load(f)
-        data["version"] = version
-        with open(manifest, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        if "version" in data:
+            del data["version"]
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump(data, f)
     return dst
 
 

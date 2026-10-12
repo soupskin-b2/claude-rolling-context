@@ -12,7 +12,13 @@ $ProxyLog = Join-Path $ClaudeDir "rolling-context-proxy.log"
 $Port = if ($env:ROLLING_CONTEXT_PORT) { $env:ROLLING_CONTEXT_PORT } else { "5588" }
 $ProxyUrl = "http://127.0.0.1:$Port"
 $PluginJson = Join-Path $ScriptDir "..\.claude-plugin\plugin.json"
-$CurrentVersion = if (Test-Path $PluginJson) { (Get-Content $PluginJson -Raw | ConvertFrom-Json).version } else { "unknown" }
+# The proxy's own version. The plugin manifest carries no pinned version (so the
+# plugin manager versions installs by commit SHA and every commit is an
+# update); bump proxy/VERSION, and only that file, when proxy/ code changes.
+$VersionFile = Join-Path $ScriptDir "..\proxy\VERSION"
+$CurrentVersion = if (Test-Path $VersionFile) { ((Get-Content $VersionFile -Raw) | ForEach-Object { $_.Trim().Split() } | Select-Object -First 1) } else { "" }
+if (-not $CurrentVersion -and (Test-Path $PluginJson)) { $CurrentVersion = (Get-Content $PluginJson -Raw | ConvertFrom-Json).version }
+if (-not $CurrentVersion) { $CurrentVersion = "unknown" }
 
 function Log($msg) {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"

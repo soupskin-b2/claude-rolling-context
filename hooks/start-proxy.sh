@@ -9,7 +9,11 @@ VERFILE="$HOME/.claude/rolling-context-proxy.version"
 HOOKLOG="$HOME/.claude/rolling-context-hook.log"
 PORT="${ROLLING_CONTEXT_PORT:-5588}"
 PROXY_URL="http://127.0.0.1:$PORT"
-CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
+# The proxy's own version. The plugin manifest carries no pinned version (so the
+# plugin manager versions installs by commit SHA and every commit is an
+# update); bump proxy/VERSION, and only that file, when proxy/ code changes.
+CURRENT_VERSION=$(cat "$SCRIPT_DIR/../proxy/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]')
+[ -n "$CURRENT_VERSION" ] || CURRENT_VERSION=$(cat "$SCRIPT_DIR/../.claude-plugin/plugin.json" 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version".*"\(.*\)".*/\1/')
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$HOOKLOG"

@@ -58,9 +58,16 @@ const healthNow = atom({ plugin: 'rolling-context', key: 'health' } as const, nu
 const isOpen = atom({ plugin: 'rolling-context', key: 'isOpen' } as const, false)
 const settingsNow = atom({ plugin: 'rolling-context', key: 'settings' } as const, null)
 const busyNow = atom({ plugin: 'rolling-context', key: 'busy' } as const, null)
+const ctxNow = atom({ plugin: 'rolling-context', key: 'ctx' } as const, null)
 
 const compact = (n: number) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n)
+
+// Context tokens with one decimal for thousands: 302500 becomes "302.5k".
+const compactCtx = (n: number) =>
+  n >= 1e6 ? `${(n / 1e6).toFixed(1)}M`
+  : n >= 1e3 ? `${(n / 1e3).toFixed(1).replace(/\.0$/, '')}k`
+  : String(n)
 
 async function isWindows($: EngineInterface) {
   return (await $.env.get('OS')) === 'Windows_NT'
@@ -120,15 +127,16 @@ function toggleAction(now: Health | null) {
     : { label: 'Turn on', args: 'on' }
 }
 
-function statusText(h: Health | null | undefined) {
+function statusText(h: Health | null | undefined, ctx: number | null) {
   if (!h) return 'proxy not running (it starts with the next session, or /roll restart)'
   const state = isOn(h)
     ? 'on'
     : h.session?.scope === 'machine-wide'
       ? 'off machine-wide'
       : 'off for this session'
+  const context = ctx == null ? '' : ` · ${compactCtx(ctx)} context`
   const busy = h.active_compressions ? ' · compressing…' : ''
-  return `${state} · ${compact(h.total_tokens_saved ?? 0)} tokens saved · ` +
+  return `${state}${context} · ${compact(h.total_tokens_saved ?? 0)} tokens saved · ` +
     `${h.stored_compressions ?? 0} stored${busy}`
 }
 
@@ -149,21 +157,36 @@ let rollRegistered = false
 // empty (its buttons already sit in the row).
 let rowDrawn = false
 
+// The session's context tokens, or null when the engine has none to report.
+async function contextTokens($: EngineInterface): Promise<number | null> {
+  try {
+    const tokens = (await $.session.usage())?.context?.tokens
+    return typeof tokens === 'number' ? tokens : null
+  } catch {
+    return null
+  }
+}
+
 // The status line under the prompt always carries the status: the row and
 // the band hold the buttons, and the line holds the words.
 async function refreshStatus($: EngineInterface) {
-  const h = await health($, await $.session.id())
+  const sessionId = await $.session.id()
+  const [h, ctx] = await Promise.all([health($, sessionId), contextTokens($)])
   await update($, healthNow, () => h ?? null)
-  $.ui.status(showStatus ? statusText(h) : undefined)
+  await update($, ctxNow, () => ctx)
+  $.ui.status(showStatus ? statusText(h, ctx) : undefined)
 }
 
-// This plugin's /config rows. The provider names the plugin id, which is the
-// bare name or `<name>@<marketplace>` (as settings.json's pluginConfigs keys
-// it), and the key is `<plugin>.<field>`; match both loosely, the way the
-// proxy's switch.py matches its own options.
+// This plugin's /config rows. The key is `<plugin>.<field>` (the engine has
+// keyed it `rolling-context.<field>` whether the plugin loaded from a
+// marketplace or inline); the provider names the plugin id, the bare name,
+// `<name>@<marketplace>` or `<name>@inline`. Either one is enough: the
+// provider's spelling has already changed under us once.
+const ours = (id: string) => id === PLUGIN || id.startsWith(`${PLUGIN}@`)
+
 function isOurs(row: { key: string; provider?: { plugin?: string } }) {
-  const provider = row.provider?.plugin ?? ''
-  return provider === PLUGIN || provider.startsWith(`${PLUGIN}@`)
+  const dot = row.key.lastIndexOf('.')
+  return (dot > 0 && ours(row.key.slice(0, dot))) || ours(row.provider?.plugin ?? '')
 }
 
 async function optionRows($: EngineInterface) {
@@ -194,10 +217,22 @@ function parseTokens(text: string) {
   return Math.round(Number(m[1]) * scale)
 }
 
+// No row for the field: say what /config does hold for it and where this copy
+// of the plugin loaded from, so a report carries the cause.
+async function noRow($: EngineInterface, field: Field) {
+  const all = await $.config.list()
+  const near = all
+    .filter(r => r.key.endsWith(`.${FIELDS[field]}`) || r.key.includes(PLUGIN))
+    .map(r => `${r.key} (${r.provider?.plugin ?? '?'})`)
+  return `No /config row for ${field}: is the plugin enabled? ` +
+    `/config has ${all.length} rows; matching: ${near.join(', ') || 'none'}; ` +
+    `plugin loaded from ${$.plugin.root}`
+}
+
 async function setOption($: EngineInterface, field: Field, raw: string): Promise<string> {
   const rows = await optionRows($)
   const row = rows.find(r => r.key.endsWith(`.${FIELDS[field]}`))
-  if (!row) return `No /config row for ${field}: is the plugin enabled?`
+  if (!row) return await noRow($, field)
   let value: string | number
   if (field === 'retention') {
     const listed = row.options?.length ? row.options : RETENTION_OPTIONS
@@ -358,12 +393,13 @@ function settingsBody(
 async function controlsRow($: EngineInterface, { Box, Button, Text }: Elements['terminal'], hint?: string) {
   const now = await read($, healthNow) // not `h`: that is the JSX factory
   const busy = await read($, busyNow)
+  const ctx = await read($, ctxNow)
   const shown = (await read($, isOpen)) || (await paneOpen($))
   const toggle = toggleAction(now)
   return (
     <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
       {showStatus ? (
-        <Text bold color="text">{`Rolling context: ${busy ?? statusText(now)}`}</Text>
+        <Text bold color="text">{`Rolling context: ${busy ?? statusText(now, ctx)}`}</Text>
       ) : null}
       {showControls ? (
         <Box flexDirection="row" columnGap={1}>
@@ -408,7 +444,9 @@ export const register: Register = (on, options) => {
   showControls = options.controls !== false
 
   on('session.start', async ($, e, next) => {
-    void refreshStatus($)
+    // Background refresh: a session that ends mid-refresh has nothing to
+    // update, so a late write failing there is dropped, not reported.
+    void refreshStatus($).catch(() => {})
     $.clock.every(STATUS_EVERY_MS, () => void refreshStatus($))
     if (!showStatus) $.ui.status(undefined)
     // A name another command already holds (a built-in or its alias, as /rc
@@ -449,7 +487,7 @@ export const register: Register = (on, options) => {
 
   // A turn may have triggered a compression; show it without waiting 30 s.
   on('turn.complete', async ($, e, next) => {
-    void refreshStatus($)
+    void refreshStatus($).catch(() => {})
     return next(e)
   })
 

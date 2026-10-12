@@ -433,6 +433,11 @@ log). Since v1.13.2:
 - **`/roll restart`** (or `/rolling-context:restart`) forces a restart when you want the new version
   now; it still waits briefly for in-flight requests.
 
+Plugin updates follow the pinned version in `plugin.json`: bump it with every
+change, or `Update now` sees nothing new. The proxy restarts only when its own
+version in `proxy/VERSION` changes, so bump that file, and only that file, when
+`proxy/` code changes — a mod-only change needs no proxy restart.
+
 Sessions still running a pre-1.13.2 plugin keep the old "restart on any
 difference" hook, so the flapping stops fully once those sessions have ended.
 

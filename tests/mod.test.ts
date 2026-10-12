@@ -9,8 +9,9 @@ const SESSION = 'sess-1234'
 type Run = { argv: readonly string[]; env: Record<string, string> }
 
 // hangFetch: /health never answers, as a fetch through a proxy that cannot
-// relay it did.
-function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false) {
+// relay it did. tokens: the context tokens $.session.usage reports, or null
+// for an engine that reports none.
+function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false, tokens: number | null = 302_500) {
   const runs: Run[] = []
   const statuses: (string | undefined)[] = []
   mock.env(on, os === 'Windows_NT'
@@ -18,6 +19,14 @@ function world(on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = f
     : { HOME: '/home/u' })
   const clock = mock.clock(on)
   on('session.id', async () => ({ value: SESSION }))
+  on('session.usage', async () => tokens === null ? ({ value: undefined }) : ({
+    value: {
+      startedAt: 0,
+      context: { tokens, window: 200_000, percent: 0 },
+      rateLimits: [],
+      cost: {},
+    },
+  }))
   on('process.run', async ($, e) => {
     runs.push({ argv: e.argv, env: { ...(e.init?.env ?? {}) } })
     return { value: { exitCode: 0, stdout, stderr: '' } }
@@ -83,7 +92,7 @@ describe('/roll', () => {
   test('the status line shows this session\'s state after a toggle', async ($, on) => {
     const w = world(on, 'Linux', 'ok')
     await $.command.run({ command: 'roll', args: 'off' })
-    expect(w.statuses.at(-1)).toBe('off for this session · 4.7M tokens saved · 40 stored')
+    expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
   })
 })
 
@@ -122,13 +131,15 @@ describe('registration', () => {
 })
 
 // The plugin's /config rows, answered beneath the mod; what it set is kept.
-// Production names the provider by plugin id (`name@marketplace`), so the
-// default id carries a marketplace suffix; pass the bare name for that shape.
-function config(on: On, id = 'rolling-context@suite') {
+// `id` is the provider's plugin id and `prefix` the keys' first part. The
+// engine (2.1.295, the desktop app) answers `rolling-context@inline` as the
+// provider and `rolling-context.<field>` as the key; the default keys by the
+// provider id, the shape the tests were first written against.
+function config(on: On, id = 'rolling-context@suite', prefix = id) {
   const values: Record<string, number | string> = {
-    [`${id}.trigger_tokens`]: 200_000,
-    [`${id}.target_tokens`]: 100_000,
-    [`${id}.retention`]: '14 days',
+    [`${prefix}.trigger_tokens`]: 200_000,
+    [`${prefix}.target_tokens`]: 100_000,
+    [`${prefix}.retention`]: '14 days',
   }
   const sets: { key: string; value: unknown }[] = []
   on('config.list', async () => ({
@@ -183,6 +194,30 @@ describe('/roll set', () => {
     expect(sets).toEqual([{ key: 'rolling-context.trigger_tokens', value: 150_000 }])
     expect(text).toMatch(/150,000 tokens/)
   })
+
+  test('finds the rows the engine answers: inline provider, bare-name keys', async ($, on) => {
+    world(on, 'Linux', '')
+    const sets = config(on, 'rolling-context@inline', 'rolling-context')
+    const { text } = await $.command.run({ command: 'roll', args: 'set retention 1 day' })
+    expect(sets).toEqual([{ key: 'rolling-context.retention', value: '1 day' }])
+    expect(text).toMatch(/retention set to 1 day/)
+  })
+
+  test('finds the rows by key when the provider is spelled some other way', async ($, on) => {
+    world(on, 'Linux', '')
+    const sets = config(on, 'rc-renamed', 'rolling-context')
+    await $.command.run({ command: 'roll', args: 'set target 50k' })
+    expect(sets).toEqual([{ key: 'rolling-context.target_tokens', value: 50_000 }])
+  })
+
+  test('with no row, says what /config holds and where the plugin loaded from', async ($, on) => {
+    world(on, 'Linux', '')
+    config(on, 'other-plugin')
+    const { text } = await $.command.run({ command: 'roll', args: 'set trigger 150k' })
+    expect(text).toMatch(/^No \/config row for trigger/)
+    expect(text).toMatch(/other-plugin\.trigger_tokens \(other-plugin\)/)
+    expect(text).toMatch(/plugin loaded from /)
+  })
 })
 
 // The panes the engine has open, answered beneath the mod; `placed` false is a
@@ -213,13 +248,13 @@ describe('the row under the prompt', () => {
       await $.command.run({ command: 'roll', args: 'status' }) // the first /health read
       const row = await $.ui.mount({ plugin: 'rolling-context', surface, component: 'PromptHint', props: HINT })
       const status = await row.find({ type: 'Text', text: /^Rolling context: / })
-      expect(status?.text).toBe('Rolling context: off for this session · 4.7M tokens saved · 40 stored')
+      expect(status?.text).toBe('Rolling context: off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
       expect(status?.props).toMatchObject({ bold: true, color: 'text' })
       expect((await row.find({ text: '? for shortcuts' }))).toBeDefined()
       // The status line keeps the status too: the row holds the buttons, the
       // line holds the words.
       await $.command.run({ command: 'roll', args: 'status' })
-      expect(w.statuses.at(-1)).toBe('off for this session · 4.7M tokens saved · 40 stored')
+      expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
 
       // The world's /health says off for this session.
       expect((await row.find({ key: 'toggle' }))?.text).toMatch(/Turn on/)
@@ -360,5 +395,37 @@ describe('the row under the prompt', () => {
     expect(await band.find({ key: 'toggle' })).toBeUndefined() // settings only
     await row.press({ key: 'settings' })
     expect(await band.find({ key: 'trigger' })).toBeUndefined()
+  })
+})
+
+describe('context token count', () => {
+  test('formats thousands with one decimal (302.5k)', async ($, on) => {
+    const w = world(on, 'Linux', 'ok')
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('off for this session · 302.5k context · 4.7M tokens saved · 40 stored')
+  })
+
+  test('trims exact thousands (40k, not 40.0k)', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, 40_000)
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('off for this session · 40k context · 4.7M tokens saved · 40 stored')
+  })
+
+  test('shows small counts plainly (999)', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, 999)
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('off for this session · 999 context · 4.7M tokens saved · 40 stored')
+  })
+
+  test('formats millions with one decimal (2.5M)', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, 2_500_000)
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('off for this session · 2.5M context · 4.7M tokens saved · 40 stored')
+  })
+
+  test('omits the segment when usage is unavailable', async ($, on) => {
+    const w = world(on, 'Linux', 'ok', false, null)
+    await $.command.run({ command: 'roll', args: 'status' })
+    expect(w.statuses.at(-1)).toBe('off for this session · 4.7M tokens saved · 40 stored')
   })
 })
