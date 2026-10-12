@@ -5,7 +5,9 @@
      beats the environment, the enabled install wins when two are present,
      a change applies without a restart, target stays below trigger, and an
      unknown retention label falls back to the default.
-  B. retention: a compression unused for longer than the setting is deleted
+  B. switch.py set writes an option into every pluginConfigs entry of this
+     plugin, checked against plugin.json, for a session with no /config rows.
+  C. retention: a compression unused for longer than the setting is deleted
      from memory (and so from disk); one in use, one still pending, and
      everything under "Never" are kept; expired ones are dropped on load.
 
@@ -107,6 +109,50 @@ def options():
           "plugin.json's dropdown lists exactly the labels switch.py understands")
 
 
+def set_direct():
+    """switch.py set: the mod's save where the session has no /config rows."""
+    print("  switch.py set (no /config rows)")
+    with open(SETTINGS, "w", encoding="utf-8") as f:
+        json.dump({"model": "opus", "pluginConfigs": {
+            "rolling-context@soupskin-plugins": {"options": {"trigger_tokens": 200000}},
+            "rolling-context@inline": {"options": {"retention": "14 days"}},
+            "other@x": {"options": {"trigger_tokens": 1}},
+        }, "enabledPlugins": {"rolling-context@soupskin-plugins": True}}, f, indent=2)
+        f.write("\n")
+    ok, said = switch.set_option("trigger_tokens", "150000")
+    with open(SETTINGS, encoding="utf-8") as f:
+        text = f.read()
+    s = json.loads(text)
+    configs = s["pluginConfigs"]
+    check(ok and said == 150000, "a token count is stored", f"{ok} {said!r}")
+    check(configs["rolling-context@soupskin-plugins"]["options"]["trigger_tokens"] == 150000
+          and configs["rolling-context@inline"]["options"]["trigger_tokens"] == 150000,
+          "into every entry of this plugin, so whichever is read holds it")
+    check(configs["rolling-context@inline"]["options"]["retention"] == "14 days"
+          and configs["other@x"]["options"]["trigger_tokens"] == 1 and s["model"] == "opus",
+          "everything else in settings.json is left as it was")
+    check(text.endswith("}\n") and not [n for n in os.listdir(os.path.dirname(SETTINGS)) if n.endswith(".tmp")],
+          "the file keeps its trailing newline and no temp file is left")
+    check(switch.trigger_tokens() == (150000, "/config"), "the proxy reads it at once")
+
+    ok, said = switch.set_option("retention", "never")
+    check(ok and said == "Never", "a retention choice is stored as plugin.json spells it", repr(said))
+    ok, said = switch.set_option("retention", "2 weeks")
+    check(not ok and "one of" in said, "a retention not listed is refused", said)
+    ok, said = switch.set_option("trigger_tokens", "10")
+    check(not ok and "20,000" in said, "a count below plugin.json's min is refused", said)
+
+    write_settings({}, enabled={"rolling-context@soupskin-plugins": True})
+    with open(switch.config_id_path(), "w", encoding="utf-8") as f:
+        f.write("rolling-context@inline\n")
+    switch.set_option("target_tokens", "50000")
+    with open(SETTINGS, encoding="utf-8") as f:
+        configs = json.load(f)["pluginConfigs"]
+    check(sorted(configs) == ["rolling-context@inline", "rolling-context@soupskin-plugins"],
+          "with no entry yet, the recorded and the enabled ids get one", str(sorted(configs)))
+    os.remove(switch.config_id_path())
+
+
 def retention():
     print("  retention")
     import server  # noqa: E402 — after the environment above is in place
@@ -154,6 +200,8 @@ def main():
     try:
         print("settings")
         options()
+        print()
+        set_direct()
         print()
         retention()
     finally:

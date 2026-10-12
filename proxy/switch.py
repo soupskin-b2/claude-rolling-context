@@ -213,6 +213,90 @@ def plugin_options():
     return value
 
 
+def _user_config():
+    """plugin.json's userConfig: the options' types, bounds and choices."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                        ".claude-plugin", "plugin.json")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f).get("userConfig") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def set_option(name, raw):
+    """Store one option in settings.json without /config: (ok, message).
+
+    The mod saves through the session's /config rows, but a desktop session
+    sometimes starts without them (the engine left the plugin out of the list
+    its rows come from, though the plugin and its mod are loaded). Then this
+    writes pluginConfigs itself, into every entry of this plugin (the one the
+    rows belong to and the enabled one), so whichever the engine and the proxy
+    read holds it. Atomic, by a replace of the whole file.
+    """
+    spec = _user_config().get(name)
+    if not isinstance(spec, dict):
+        return False, f"no option {name!r} in plugin.json"
+    if spec.get("type") == "number":
+        try:
+            value = int(raw)
+        except ValueError:
+            return False, f"{name} takes a whole number of tokens"
+        lo, hi = spec.get("min"), spec.get("max")
+        if (lo is not None and value < lo) or (hi is not None and value > hi):
+            span = (f"{lo:,} to {hi:,}" if lo is not None and hi is not None
+                    else f"at least {lo:,}" if lo is not None else f"at most {hi:,}")
+            return False, f"{name} takes {span} tokens"
+    else:
+        choices = spec.get("options") or []
+        value = next((c for c in choices if c.lower() == raw.strip().lower()), None)
+        if value is None:
+            return False, f"{name} takes one of: {', '.join(choices)}"
+    path = claude_settings_path()
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+        settings = json.loads(text) if text.strip() else {}
+    except FileNotFoundError:
+        text, settings = "", {}
+    except (OSError, ValueError) as e:
+        return False, f"settings.json could not be read ({e}); not changed"
+    configs = settings.setdefault("pluginConfigs", {})
+    enabled = settings.get("enabledPlugins") or {}
+    ids = {i for i in configs if i == PLUGIN_NAME or i.startswith(PLUGIN_NAME + "@")}
+    ids |= {i for i in (_config_id(),) if i}
+    ids |= {i for i, on in enabled.items() if on is True and i.startswith(PLUGIN_NAME + "@")}
+    if not ids:
+        ids = {PLUGIN_NAME}
+    for i in ids:
+        entry = configs.get(i) if isinstance(configs.get(i), dict) else {}
+        opts = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+        opts[name] = value
+        entry["options"] = opts
+        configs[i] = entry
+    out = json.dumps(settings, indent=2, ensure_ascii=False) + ("\n" if text.endswith("\n") or not text else "")
+    tmp = f"{path}.rolling-context-{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(out)
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                # Windows refuses the replace while another process has it open.
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False, f"settings.json could not be written ({e}); not changed"
+    return True, value
+
+
 def _int_option(name, env, default, minimum):
     """(value, source): /config first, then the environment, then the default."""
     v = plugin_options().get(name)
@@ -475,7 +559,22 @@ def main():
         print("change these in /config")
         return
 
-    print(f"Unknown action {action!r} — expected on, off, or status")
+    if action == "set":
+        # switch.py set <option> <value...>, the value as typed ("3 days").
+        words, it = [], iter(sys.argv[1:])
+        for a in it:
+            if a == "--session":
+                next(it, None)
+            elif not a.startswith("-"):
+                words.append(a)
+        if len(words) < 3:
+            print("Usage: switch.py set <trigger_tokens|target_tokens|retention> <value>")
+            sys.exit(2)
+        ok, said = set_option(words[1], " ".join(words[2:]))
+        print(f"{words[1]} = {said}" if ok else said)
+        sys.exit(0 if ok else 1)
+
+    print(f"Unknown action {action!r} — expected on, off, status or set")
     sys.exit(2)
 
 

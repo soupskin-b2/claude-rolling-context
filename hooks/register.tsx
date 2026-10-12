@@ -1,12 +1,9 @@
 // rolling-context's mod: the switch, the settings and the status, without a
 // Claude turn.
 //
-// The plugin's commands/*.md are prompt templates: Claude has to read one,
-// run switch.py through Bash and echo the result, and while it is mid-turn
-// they wait for the turn to end. Here /roll runs switch.py itself and prints
-// its output as the command's own. The .md commands stay as the fallback
-// where mods do not load; where they do, this module answers them too (still
-// no Claude turn) and hides them from the menu so /roll is the one listed.
+// /roll runs switch.py itself and prints its output as the command's own: no
+// prompt template for Claude to read, run through Bash and echo, and nothing
+// that waits for a turn to end. It is the plugin's only command.
 //
 // A command typed mid-turn may still wait for the turn on some surfaces, so
 // the same controls also sit beside the status: in the row under the prompt,
@@ -217,9 +214,26 @@ async function recordConfigId($: EngineInterface, id: string | undefined) {
   }
 }
 
+// The options as settings.json holds them, for a session without rows: the
+// entry the rows were last recorded under first, as the proxy reads them.
+async function storedOptions($: EngineInterface): Promise<Record<string, unknown>> {
+  try {
+    const dir = `${await home($)}/.claude`
+    const configs = JSON.parse(await $.fs.read(`${dir}/settings.json`))?.pluginConfigs ?? {}
+    const live = (await $.fs.read(`${dir}/rolling-context-config-id`).catch(() => '')).trim()
+    const ids = Object.keys(configs).filter(ours).sort((a, b) => Number(b === live) - Number(a === live))
+    return ids.map(i => configs[i]?.options).find(o => o && typeof o === 'object') ?? {}
+  } catch {
+    return {}
+  }
+}
+
 async function loadSettings($: EngineInterface) {
   const rows = await optionRows($)
-  const row = (field: string) => rows.find(r => r.key.endsWith(`.${field}`))
+  const stored = rows.length ? {} : await storedOptions($)
+  const row = (field: string) =>
+    rows.find(r => r.key.endsWith(`.${field}`)) ??
+    (stored[field] === undefined ? undefined : { value: stored[field], options: undefined })
   const retention = row(FIELDS.retention)
   const retentionOpts = retention?.options
   const settings: Settings = {
@@ -252,13 +266,35 @@ async function noRow($: EngineInterface, field: Field) {
     `plugin loaded from ${$.plugin.root}`
 }
 
+// A desktop session sometimes starts with none of the plugin's rows in
+// /config: the engine builds them from its list of enabled plugins and has
+// left this one out, though the plugin and this mod are loaded. switch.py then
+// writes the option into settings.json's pluginConfigs itself, where both the
+// proxy and the next session's /config read it.
+async function setDirect($: EngineInterface, field: Field, value: string | number) {
+  const r = await runPython(
+    $,
+    [`${$.plugin.root}/proxy/switch.py`, 'set', FIELDS[field], String(value)],
+    { PYTHONIOENCODING: 'utf-8' },
+  )
+  if (r.exitCode !== 0) {
+    return `Not changed: ${clean(r.stdout) || clean(r.stderr) || `switch.py exited ${r.exitCode}`}\n` +
+      (await noRow($, field))
+  }
+  await loadSettings($)
+  return `${field} set to ${shown(value)} in settings.json (this session's /config ` +
+    `has no rows for the plugin; /reload-plugins brings them back). The proxy reads it on its next request.`
+}
+
+const shown = (value: string | number) =>
+  typeof value === 'number' ? `${value.toLocaleString('en-US')} tokens` : value
+
 async function setOption($: EngineInterface, field: Field, raw: string): Promise<string> {
   const rows = await optionRows($)
   const row = rows.find(r => r.key.endsWith(`.${FIELDS[field]}`))
-  if (!row) return await noRow($, field)
   let value: string | number
   if (field === 'retention') {
-    const listed = row.options?.length ? row.options : RETENTION_OPTIONS
+    const listed = row?.options?.length ? row.options : RETENTION_OPTIONS
     const want = raw.trim().toLowerCase().replace(/\s+/g, ' ')
     const match = listed.find(o => o.toLowerCase() === want)
     if (!match) return `retention takes one of: ${listed.join(', ')}`
@@ -267,11 +303,11 @@ async function setOption($: EngineInterface, field: Field, raw: string): Promise
     value = parseTokens(raw)
     if (!Number.isFinite(value)) return `${field} takes a token count, such as 150000 or 150k`
   }
+  if (!row) return await setDirect($, field, value)
   const { deny } = await $.config.set({ key: row.key, value })
   if (deny) return `Not changed: ${deny}`
   await loadSettings($)
-  const shown = typeof value === 'number' ? `${value.toLocaleString('en-US')} tokens` : value
-  return `${field} set to ${shown}. The proxy reads it on its next request.`
+  return `${field} set to ${shown(value)}. The proxy reads it on its next request.`
 }
 
 async function restart($: EngineInterface): Promise<string> {

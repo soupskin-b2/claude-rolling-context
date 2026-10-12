@@ -14,7 +14,7 @@ type Run = { argv: readonly string[]; env: Record<string, string> }
 // session (a proxy before 1.14.9 counts no compressions there).
 const SESSION_HEALTH = { enabled: false, scope: 'this session', compressions: 3, tokens_saved: 393_580 }
 function world(
-  on: On, os: 'Windows_NT' | 'Linux', stdout: string, hangFetch = false,
+  on: On, os: 'Windows_NT' | 'Linux', out: string | { stdout: string; exitCode: number }, hangFetch = false,
   tokens: number | null = 302_500, session: object = SESSION_HEALTH, active = 0,
 ) {
   const runs: Run[] = []
@@ -34,7 +34,8 @@ function world(
   }))
   on('process.run', async ($, e) => {
     runs.push({ argv: e.argv, env: { ...(e.init?.env ?? {}) } })
-    return { value: { exitCode: 0, stdout, stderr: '' } }
+    const { stdout, exitCode } = typeof out === 'string' ? { stdout: out, exitCode: 0 } : out
+    return { value: { exitCode, stdout, stderr: '' } }
   })
   on('http.fetch', async () => hangFetch ? new Promise<never>(() => {}) : ({
     value: {
@@ -225,11 +226,31 @@ describe('/roll set', () => {
     expect(sets).toEqual([{ key: 'rolling-context.target_tokens', value: 50_000 }])
   })
 
-  test('with no row, says what /config holds and where the plugin loaded from', async ($, on) => {
-    world(on, 'Linux', '')
+  // A desktop session can start with none of the plugin's rows (the engine
+  // left it out of the plugins it builds them from): switch.py writes it.
+  test('with no row, switch.py writes the option into settings.json', async ($, on) => {
+    const w = world(on, 'Linux', 'trigger_tokens = 150000')
     config(on, 'other-plugin')
     const { text } = await $.command.run({ command: 'roll', args: 'set trigger 150k' })
-    expect(text).toMatch(/^No \/config row for trigger/)
+    expect(w.runs.at(-1)!.argv.slice(1)).toEqual([
+      expect.stringMatching(/proxy\/switch\.py$/), 'set', 'trigger_tokens', '150000'])
+    expect(text).toMatch(/^trigger set to 150,000 tokens in settings\.json/)
+  })
+
+  test('a retention choice is checked before it is written, without a row too', async ($, on) => {
+    const w = world(on, 'Linux', '')
+    config(on, 'other-plugin')
+    const { text } = await $.command.run({ command: 'roll', args: 'set retention 2 weeks' })
+    expect(text).toMatch(/one of: 1 hour, 6 hours/)
+    expect(w.runs.length).toBe(0)
+  })
+
+  test('when that write fails too, says why, what /config holds and where the plugin loaded from', async ($, on) => {
+    world(on, 'Linux', { stdout: 'settings.json could not be written (EACCES); not changed', exitCode: 1 })
+    config(on, 'other-plugin')
+    const { text } = await $.command.run({ command: 'roll', args: 'set trigger 150k' })
+    expect(text).toMatch(/^Not changed: settings\.json could not be written/)
+    expect(text).toMatch(/No \/config row for trigger/)
     expect(text).toMatch(/other-plugin\.trigger_tokens \(other-plugin\)/)
     expect(text).toMatch(/plugin loaded from /)
   })
@@ -382,6 +403,37 @@ describe('the row under the prompt', () => {
       '1 hour', '6 hours', '1 day', '3 days', '7 days', '14 days', '30 days', 'Never',
     ])
     await pane.select({ key: 'retention', value: 'Never' }) // accepted, not "takes one of"
+  })
+
+  test('with no rows, the pane shows what settings.json holds, the recorded entry first', async ($, on) => {
+    world(on, 'Linux', '')
+    config(on, 'other-plugin')
+    const files: Record<string, string> = {
+      '/home/u/.claude/rolling-context-config-id': 'rolling-context@inline\n',
+      '/home/u/.claude/settings.json': JSON.stringify({
+        pluginConfigs: {
+          'rolling-context@soupskin-plugins': { options: { trigger_tokens: 200_000 } },
+          'rolling-context@inline': { options: { trigger_tokens: 180_000, retention: '3 days' } },
+          'other-plugin': { options: { trigger_tokens: 1 } },
+        },
+      }),
+    }
+    on('fs.read', async ($, e) => {
+      // The engine hands the read a native path.
+      const path = Object.keys(files).find(f => e.path.replace(/\\/g, '/').endsWith(f))
+      return path ? { value: files[path] } : { deny: 'ENOENT' }
+    })
+    panes(on)
+    await start($, on)
+    const row = await $.ui.mount({ plugin: 'rolling-context', surface: 'desktop', component: 'PromptHint', props: HINT })
+    await row.press({ key: 'settings' })
+    const pane = await $.ui.mount({
+      plugin: 'rolling-context', surface: 'desktop', component: 'Pane', requestId: 'settings',
+      props: { title: 'Rolling context settings', bodyColumns: 80, scroll: { offset: 0, bodyRows: 5 }, view: {} },
+    } as Parameters<typeof $.ui.mount>[0])
+    expect((await pane.find({ key: 'trigger' }))?.props.value).toBe('180000')
+    expect((await pane.find({ key: 'target' }))?.props.value).toBe('40000') // the default
+    expect((await pane.find({ key: 'retention' }))?.props.value).toBe('3 days')
   })
 
   test('where no pane can be placed, Settings toggles the box above the prompt', async ($, on) => {
