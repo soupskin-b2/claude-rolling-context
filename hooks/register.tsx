@@ -102,11 +102,14 @@ async function health($: EngineInterface, sessionId: string): Promise<Health | u
       $.http.fetch(`http://127.0.0.1:${port}/health?session=${encodeURIComponent(sessionId)}`),
       $.clock.sleep(HEALTH_TIMEOUT_MS).then(() => undefined),
     ])
-    if (!r || !r.ok) return undefined
+    if (!r) return noteHealth($, `no answer from :${port} within ${HEALTH_TIMEOUT_MS} ms`)
+    if (!r.ok) return noteHealth($, `:${port} answered HTTP ${r.status}`)
     const body = JSON.parse(r.text) as Health
-    return body.service === 'rolling-context' ? body : undefined
-  } catch {
-    return undefined
+    if (body.service !== 'rolling-context') return noteHealth($, `:${port} is not this proxy`)
+    noteHealth($, `ok: v${body.version ?? '?'} on :${port}`)
+    return body
+  } catch (err) {
+    return noteHealth($, `fetch of :${port} failed: ${String(err)}`)
   }
 }
 
@@ -478,18 +481,36 @@ async function controlsRow($: EngineInterface, { Box, Button, Text }: Elements['
   )
 }
 
-// Which of its sites each surface has asked this plugin to draw, kept in
-// ~/.claude/rolling-context-ui.json: hosts differ (the desktop app never
-// asks for the row under the prompt), and this says what a host offers.
+// What this module has seen, kept in ~/.claude/rolling-context-ui.json: when
+// and from where it last loaded, how its last /health went, and which of its
+// sites each surface has asked it to draw (hosts differ: the desktop app
+// never asks for the row under the prompt). Where no status line shows, this
+// tells the causes apart, which the proxy's log cannot (it is silent for
+// both): no file or a stale `loaded`, the host never loaded the module; a
+// failing `health`, it loaded and cannot reach the proxy.
 const sitesSeen = new Set<string>()
+const diag = { loaded: '', health: '' }
+function writeDiag($: EngineInterface) {
+  $.clock.sleep(0).then(async () => {
+    await $.fs.write(`${await home($)}/.claude/rolling-context-ui.json`,
+      JSON.stringify({ ...diag, sites: [...sitesSeen].sort() }, null, 1))
+  }).catch(() => {}) // a diagnostic only
+}
+
 function seen($: EngineInterface, e: { component: string; surface: string }) {
   const site = `${e.surface}:${e.component}`
   if (sitesSeen.has(site)) return
   sitesSeen.add(site)
-  $.clock.sleep(0).then(async () => {
-    await $.fs.write(`${await home($)}/.claude/rolling-context-ui.json`,
-      JSON.stringify({ sites: [...sitesSeen].sort() }, null, 1))
-  }).catch(() => {}) // a diagnostic only
+  writeDiag($)
+}
+
+// Written when the outcome changes, not on every 30 s poll.
+function noteHealth($: EngineInterface, outcome: string): undefined {
+  if (outcome !== diag.health) {
+    diag.health = outcome
+    writeDiag($)
+  }
+  return undefined
 }
 
 // A command hook that throws would otherwise fall through to the .md
@@ -503,6 +524,8 @@ export const register: Register = (on, options) => {
   showControls = options.controls !== false
 
   on('session.start', async ($, e, next) => {
+    diag.loaded = `${new Date(await $.clock.now()).toISOString()} from ${$.plugin.root}`
+    writeDiag($)
     // Background refresh: a session that ends mid-refresh has nothing to
     // update, so a late write failing there is dropped, not reported.
     void refreshStatus($).catch(() => {})

@@ -81,7 +81,11 @@ def clean_env(home, **extra):
         env.pop(k, None)
     # Never the default MITM port: a test proxy there shares it with the
     # user's real proxy (Windows) and answers their sessions with a test CA.
+    # Nor the default proxy port: `switch.py status` asks /health there, so a
+    # bare switch_cmd reached the developer's live proxy. A closed port reads
+    # "NOT RUNNING"; a test that wants its own proxy passes its port in extra.
     env.update(HOME=home, USERPROFILE=home,
+               ROLLING_CONTEXT_PORT=str(free_port()),
                ROLLING_CONTEXT_MITM_PORT=str(free_port()))
     env.update(extra)
     return env

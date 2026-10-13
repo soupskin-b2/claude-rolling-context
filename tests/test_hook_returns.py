@@ -17,6 +17,7 @@ platform's hook the same way, in a throwaway home on free ports, and times it.
 """
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -131,9 +132,14 @@ def main():
         with open(hook_log, encoding="utf-8-sig", errors="replace") as f:
             f.seek(before)
             tail = f.read()
-        started = {int(w) for line in tail.splitlines() if "Proxy started with PID" in line
-                   for w in line.split() if w.isdigit()}
+        # "Proxy started with PID n" is start-proxy.ps1's alone; both hooks
+        # write "Proxy healthy on :port (vX, PID n)" and "handed over to PID n".
+        started = {int(m.group(1)) for line in tail.splitlines()
+                   if "Proxy started with PID" in line or "Proxy healthy on" in line
+                   or "handed over to PID" in line
+                   for m in [re.search(r"PID (\d+)", line)] if m}
         pids |= started
+        pids |= {h["pid"] for h in (h3, h4) if h}
         time.sleep(1)  # the drained ones finish exiting
         alive = sorted(pid for pid in started if _alive(pid))
         check(results, "the hooks ran one at a time (no restart lost to a racing proxy)",
@@ -145,6 +151,11 @@ def main():
         check(results, "one proxy left running",
               alive == [(h4 or {}).get("pid")], f"alive: {alive}")
     finally:
+        # Whatever still serves the test port is ours too, should a step have
+        # failed before its PID was collected.
+        last = health(port)
+        if last:
+            pids.add(last["pid"])
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)
