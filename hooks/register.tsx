@@ -18,10 +18,23 @@
 //
 // The status line under the prompt always carries the status, and the row,
 // the band and the settings read the proxy's /health for this session.
+//
+// Move session, in the band, moves a stopped desktop app session to another
+// account signed in on this computer (proxy/move_session.py says how, and why
+// the transcript, scratchpad and compressions need nothing moved). Its pane
+// also imports: it lists another account's sessions and moves the one picked
+// into this session's account.
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { RollingContextHealth as Health, RollingContextSettings as Settings } from '../types'
+import type {
+  RollingContextAccount as Account,
+  RollingContextHealth as Health,
+  RollingContextImportList as ImportList,
+  RollingContextImportSession as ImportSession,
+  RollingContextMove as Move,
+  RollingContextSettings as Settings,
+} from '../types'
 
 const PLUGIN = 'rolling-context'
 const ACTIONS = ['status', 'on', 'off', 'restart', 'set'] as const
@@ -30,6 +43,9 @@ const STATUS_EVERY_MS = 30_000
 const USAGE =
   'Usage: /roll [status|on|off|restart] [--global], or /roll set <trigger|target|retention> <value>'
 const PANE = 'settings'
+const MOVE_PANE = 'move'
+// The desktop app's session tools, as its MCP server is named.
+const APP_SESSIONS = 'ccd_session_mgmt'
 
 // The retention choices from userConfig, when the /config row carries no
 // options of its own (then the dropdown would offer only the current value).
@@ -55,6 +71,19 @@ const isOpen = atom({ plugin: 'rolling-context', key: 'isOpen' } as const, false
 const settingsNow = atom({ plugin: 'rolling-context', key: 'settings' } as const, null)
 const busyNow = atom({ plugin: 'rolling-context', key: 'busy' } as const, null)
 const ctxNow = atom({ plugin: 'rolling-context', key: 'ctx' } as const, null)
+// The Move session pane's: the accounts answer, its fallback box, the pick
+// and what a move in progress says.
+const moveNow = atom({ plugin: 'rolling-context', key: 'move' } as const, null)
+const moveOpen = atom({ plugin: 'rolling-context', key: 'moveOpen' } as const, false)
+const moveTo = atom({ plugin: 'rolling-context', key: 'moveTo' } as const, null)
+const moveBusy = atom({ plugin: 'rolling-context', key: 'moveBusy' } as const, null)
+// Its import section's: the account, its sessions, the pick, whether the
+// archived ones show and what an import in progress says.
+const importFrom = atom({ plugin: 'rolling-context', key: 'importFrom' } as const, null)
+const importList = atom({ plugin: 'rolling-context', key: 'importList' } as const, null)
+const importPick = atom({ plugin: 'rolling-context', key: 'importPick' } as const, null)
+const importArchived = atom({ plugin: 'rolling-context', key: 'importArchived' } as const, false)
+const importBusy = atom({ plugin: 'rolling-context', key: 'importBusy' } as const, null)
 
 const compact = (n: number) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n)
@@ -159,6 +188,9 @@ const clean = (text: string) =>
 // Set from the options in register; /config changes reload the module.
 let showStatus = true
 let showControls = true
+let showMove = true
+// Whether a model turn runs: a session moves only while stopped.
+let working = false
 // Whether a surface draws the row under the prompt; then the band stays
 // empty (its buttons already sit in the row).
 let rowDrawn = false
@@ -384,8 +416,8 @@ async function act($: EngineInterface, work: Promise<string>) {
   }
 }
 
-async function paneOpen($: EngineInterface) {
-  return (await $.ui.panes()).some(p => p.id === PANE)
+async function paneOpen($: EngineInterface, id = PANE) {
+  return (await $.ui.panes()).some(p => p.id === id)
 }
 
 // Settings: a pane of their own, closed again by the same button. A press is
@@ -447,6 +479,411 @@ function settingsBody(
       <Text dimColor>Enter sets a number; the proxy reads it on its next request.</Text>
     </Box>
   )
+}
+
+// ---- Move session ----------------------------------------------------------
+
+// move_session.py's answer, one JSON object; anything else is its failure.
+async function moveScript($: EngineInterface, args: string[]): Promise<Record<string, unknown>> {
+  const r = await runPython(
+    $, [`${$.plugin.root}/proxy/move_session.py`, ...args], { PYTHONIOENCODING: 'utf-8' },
+  )
+  try {
+    return JSON.parse(r.stdout) as Record<string, unknown>
+  } catch {
+    throw new Error(clean(r.stderr) || clean(r.stdout) || `move_session.py exited ${r.exitCode}`)
+  }
+}
+
+// This session's record, the accounts and any move waiting; the pick stays
+// while it is still another account, else the first other one.
+async function loadMove($: EngineInterface) {
+  const info = (await moveScript($, ['accounts', '--session', await $.session.id()])) as Move
+  const here = info.session?.account
+  await update($, moveNow, () => info)
+  await update($, moveTo, cur =>
+    cur && cur !== here && info.accounts.some(a => a.account === cur)
+      ? cur
+      : (info.accounts.find(a => a.account !== here)?.account ?? null))
+  return info
+}
+
+const accountLabel = (a: Account | undefined, id = '') =>
+  a?.name || a?.email || `Account ${(a?.account ?? id).slice(0, 8)}`
+
+function ago(ms: number, now: number) {
+  const min = Math.max(0, Math.round((now - ms) / 60_000))
+  return min < 60 ? `${min}m ago` : min < 48 * 60 ? `${Math.round(min / 60)}h ago` : `${Math.round(min / 1440)}d ago`
+}
+
+// What tells the accounts apart where no email is known: the latest session.
+function accountDetail(a: Account, now: number) {
+  const count = `${a.sessions} session${a.sessions === 1 ? '' : 's'}`
+  if (!a.latestTitle) return count
+  const when = a.latestAt ? `, ${ago(a.latestAt, now)}` : ''
+  return `${count} · latest${a.latestArchived ? ' (archived)' : ''}: ${a.latestTitle}${when}`
+}
+
+async function nameAccount($: EngineInterface, account: string, text: string) {
+  await moveScript($, ['name', '--account', account, '--name', text])
+  await loadMove($)
+  return text.trim() ? `Named it ${text.trim()}` : 'Name cleared'
+}
+
+// The app archives this session here, which stops its CLI: from then on only
+// the other account opens the transcript. The finisher prepare started then
+// removes the record here. Refused, or no app to ask (a terminal), the move
+// waits: archiving the session by hand finishes it, Cancel move undoes it.
+async function archiveHere($: EngineInterface, label: string) {
+  if (working) return $.ui.toast('Stop the current turn first: a session moves once it is stopped')
+  let said = ''
+  try {
+    const r = await $.mcp.call(APP_SESSIONS, 'archive_session', {
+      session_id: 'self', reason: `Moving this session to ${label}`,
+    })
+    said = r.content.map(c => c.text ?? '').join(' ').trim()
+    // Archived, this process ends within moments; still here, it was not.
+    if (!r.isError) await $.clock.sleep(5_000)
+  } catch (err) {
+    said = String(err)
+  }
+  await loadMove($).catch(() => {})
+  $.ui.toast(`Copied to ${label} but not archived here${said ? ` (${said})` : ''}: ` +
+    'archive this session from the sidebar to finish, or Cancel move')
+}
+
+async function startMove($: EngineInterface) {
+  const info = await read($, moveNow)
+  const to = await read($, moveTo)
+  const pick = info?.accounts.find(a => a.account === to)
+  if (!info?.session || !pick) return $.ui.toast('Pick an account to move this session to')
+  if (working) return $.ui.toast('Stop the current turn first: a session moves once it is stopped')
+  const label = accountLabel(pick)
+  await update($, moveBusy, () => `copying it to ${label}…`)
+  try {
+    const out = await moveScript($, ['prepare', '--session', await $.session.id(), '--to', pick.account])
+    if (!out.ok) return $.ui.toast(`Not moved: ${String(out.error ?? 'move_session.py refused')}`)
+    await loadMove($)
+    await update($, moveBusy, () => `archiving it here so ${label} can open it…`)
+    $.ui.toast(`Copied to ${label}; archiving it here finishes the move`)
+    await archiveHere($, label)
+  } catch (err) {
+    $.ui.toast(`Move session: ${String(err)}`)
+  } finally {
+    await update($, moveBusy, () => null).catch(() => {}) // the session may be ending
+  }
+}
+
+async function cancelMove($: EngineInterface) {
+  const out = await moveScript($, ['cancel', '--session', await $.session.id()])
+  await loadMove($)
+  return out.ok ? 'Move cancelled: the copy in the other account is gone' : String(out.error)
+}
+
+// ---- Import from another account -------------------------------------------
+
+const shownSessions = (list: ImportList, archived: boolean) =>
+  list.sessions.filter(s => archived || !s.archived)
+
+// The account to import from (the one asked for, else the pick while it is
+// still another account, else the first other one) and its sessions; the
+// session picked stays while the list still shows it.
+async function loadImport($: EngineInterface, account?: string) {
+  const info = await read($, moveNow)
+  const here = info?.session?.account
+  const others = info?.accounts.filter(a => a.account !== here) ?? []
+  const want = account ?? (await read($, importFrom))
+  const from = others.find(a => a.account === want)?.account ?? others[0]?.account ?? null
+  await update($, importFrom, () => from)
+  if (!from) return
+  const list = (await moveScript($, ['sessions', '--account', from])) as unknown as ImportList
+  if (!list.ok) throw new Error(String((list as { error?: unknown }).error ?? 'move_session.py refused'))
+  const shown = shownSessions(list, await read($, importArchived))
+  await update($, importList, () => list)
+  await update($, importPick, cur =>
+    shown.some(s => s.localId === cur) ? cur : (shown[0]?.localId ?? null))
+}
+
+async function pickImportFrom($: EngineInterface, account: string) {
+  await update($, importFrom, () => account)
+  await loadImport($, account).catch(err => $.ui.toast(`Import: ${String(err)}`))
+}
+
+async function toggleArchived($: EngineInterface) {
+  const archived = !(await read($, importArchived))
+  await update($, importArchived, () => archived)
+  const list = await read($, importList)
+  const shown = list ? shownSessions(list, archived) : []
+  await update($, importPick, cur =>
+    shown.some(s => s.localId === cur) ? cur : (shown[0]?.localId ?? null))
+}
+
+const short = (text: string, n = 40) => (text.length > n ? `${text.slice(0, n - 1)}…` : text)
+
+function sessionLabel(s: ImportSession, now: number) {
+  const folder = (s.cwd ?? '').split(/[\\/]/).filter(Boolean).pop() ?? 'no folder'
+  const when = s.lastActivityAt ? ago(s.lastActivityAt, now) : 'never active'
+  return `${s.title || 'Untitled'} · ${when} · ${folder}${s.archived ? ' (archived)' : ''}` +
+    `${s.blocked ? " · can't import" : ''}`
+}
+
+// Moves the picked session into this account at once: only the account
+// signed in runs sessions, so nothing of the other one is running. The app
+// lists it once it rereads this account's sessions.
+async function importSession($: EngineInterface) {
+  const info = await read($, moveNow)
+  const from = await read($, importFrom)
+  const list = await read($, importList)
+  const localId = await read($, importPick)
+  const pick = list?.account === from ? list?.sessions.find(s => s.localId === localId) : undefined
+  if (!from || !pick) return $.ui.toast('Pick a session to import')
+  const source = accountLabel(info?.accounts.find(a => a.account === from), from)
+  const title = pick.title || 'the session'
+  await update($, importBusy, () => `importing "${title}" from ${source}…`)
+  try {
+    const out = await moveScript($, [
+      'import', '--session', await $.session.id(), '--from', from, '--local', pick.localId, '--open',
+    ])
+    if (!out.ok) return $.ui.toast(`Not imported: ${String(out.error ?? 'move_session.py refused')}`)
+    const done = out.imported as { localId: string, opened?: boolean } | undefined
+    const listed = done?.opened ? await keepTitle($, done.localId, pick.title) : false
+    $.ui.toast(listed
+      ? `Imported "${title}" from ${source}: it is in this account's sidebar now`
+      : `Imported "${title}" from ${source}: restart the Claude app to see it in the sidebar`)
+    await loadMove($)
+    await loadImport($)
+  } catch (err) {
+    $.ui.toast(`Import: ${String(err)}`)
+  } finally {
+    await update($, importBusy, () => null)
+  }
+}
+
+// The app adopts the session from the resume link within moments, naming it
+// from its transcript; the title it had in the other account goes back on.
+// False when the app never lists it (a terminal, or the link went nowhere).
+async function keepTitle($: EngineInterface, localId: string, title: string) {
+  for (let i = 0; i < 10; i++) {
+    try {
+      const r = await $.mcp.call(APP_SESSIONS, 'get_session', { session_id: localId })
+      if (!r.isError) {
+        const text = r.content.map(c => c.text ?? '').join('')
+        if (title && !text.includes(JSON.stringify(title))) {
+          await $.mcp.call(APP_SESSIONS, 'set_session_title', { session_id: localId, title })
+            .catch(() => {})
+        }
+        return true
+      }
+    } catch {
+      return false
+    }
+    await $.clock.sleep(1_000)
+  }
+  return false
+}
+
+const IMPORT_NOTE =
+  'Importing moves it: it leaves that account and is listed under this one, live even if it ' +
+  'was archived. Its transcript, scratchpad and rolling-context compressions stay on this ' +
+  'computer under the same session id, so it carries on where it left off.'
+
+async function importSection(
+  $: EngineInterface,
+  { Box, Button, Select, Text }: Elements['terminal'],
+  others: Account[],
+) {
+  const now = await $.clock.now()
+  const fromId = await read($, importFrom)
+  const from = others.find(a => a.account === fromId)
+  const list = await read($, importList)
+  const fromSelect = (
+    <Select
+      key="import-from"
+      label="From "
+      options={others.map(a => ({ value: a.account, label: `${accountLabel(a)} · ${accountDetail(a, now)}` }))}
+      value={from?.account}
+      onSelect={v => void pickImportFrom($, v)}
+    />
+  )
+  if (!from || list?.account !== from.account) {
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        <Text bold>Import from another account</Text>
+        {fromSelect}
+        <Text dimColor>Looking at its sessions…</Text>
+      </Box>
+    )
+  }
+  const archived = await read($, importArchived)
+  const shown = shownSessions(list, archived)
+  const archivedCount = list.sessions.filter(s => s.archived).length
+  const pickId = await read($, importPick)
+  const pick = shown.find(s => s.localId === pickId) ?? shown[0]
+  const busy = await read($, importBusy)
+  return (
+    <Box flexDirection="column" rowGap={1}>
+      <Text bold>Import from another account</Text>
+      {fromSelect}
+      {pick ? (
+        <Select
+          key="import-session"
+          label="Session "
+          options={shown.map(s => ({ value: s.localId, label: sessionLabel(s, now) }))}
+          value={pick.localId}
+          onSelect={v => void update($, importPick, () => v)}
+        />
+      ) : (
+        <Text dimColor>
+          {archivedCount ? 'It has only archived sessions here.' : 'It has no sessions on this computer.'}
+        </Text>
+      )}
+      {pick ? <Text dimColor>{`In ${pick.cwd ?? 'no folder'}${pick.kind === 'folder' ? '' : ` (${pick.kind})`}`}</Text> : null}
+      {pick?.blocked ? <Text color="warning">{pick.blocked}</Text> : <Text dimColor>{IMPORT_NOTE}</Text>}
+      <Box flexDirection="row" columnGap={1}>
+        {pick && !pick.blocked && !busy ? (
+          <Button key="import-go" label={`Import "${short(pick.title || 'Untitled')}"`} onPress={() => void importSession($)} />
+        ) : null}
+        {archivedCount ? (
+          <Button
+            key="import-archived"
+            label={archived ? 'Hide archived' : `Show archived (${archivedCount})`}
+            onPress={() => void toggleArchived($)}
+          />
+        ) : null}
+      </Box>
+      {busy ? <Text dimColor>{busy}</Text> : null}
+    </Box>
+  )
+}
+
+// The pane, closed again by the same button; the box above the prompt where
+// no pane is placed, as the settings do.
+async function toggleMove($: EngineInterface) {
+  if (await paneOpen($, MOVE_PANE)) {
+    await $.ui.close({ id: MOVE_PANE })
+    $.ui.invalidate('ui.render')
+    return
+  }
+  if (await read($, moveOpen)) return update($, moveOpen, () => false)
+  try {
+    await loadMove($)
+  } catch (err) {
+    return $.ui.toast(`Move session: ${String(err)}`)
+  }
+  void loadImport($).catch(err => $.ui.toast(`Import: ${String(err)}`))
+  const opened = await $.ui.open({
+    id: MOVE_PANE, title: 'Move session', focus: true, closeOnEscape: true, rows: 20,
+  })
+  $.ui.invalidate('ui.render')
+  if (!opened.isPlaced) {
+    await $.ui.close({ id: MOVE_PANE })
+    await update($, moveOpen, () => true)
+  }
+}
+
+const MOVE_NOTE =
+  'It is archived here and listed under that account: switch the Claude app to it and open ' +
+  'the session. The transcript, scratchpad and rolling-context compressions stay on this ' +
+  'computer under the same session id, so it carries on where it left off.'
+
+// Moving this session away, then importing one from another account, then
+// Close.
+async function moveBody($: EngineInterface, el: Elements['terminal']) {
+  const { Box, Button, Text } = el
+  const info = await read($, moveNow)
+  if (!info) return <Text dimColor>Looking for this computer's accounts…</Text>
+  const session = info.session
+  if (!session) return <Text dimColor>{info.blocked ?? 'This session has no Claude app record.'}</Text>
+  const others = info.accounts.filter(a => a.account !== session.account)
+  return (
+    <Box flexDirection="column" rowGap={1}>
+      {await moveSection($, el, info, session)}
+      {others.length ? await importSection($, el, others) : null}
+      <Button key="move-close" label="Close" onPress={() => void toggleMove($)} />
+    </Box>
+  )
+}
+
+async function moveSection(
+  $: EngineInterface,
+  { Box, Button, Input, Select, Text }: Elements['terminal'],
+  info: Move,
+  session: NonNullable<Move['session']>,
+) {
+  const busy = await read($, moveBusy)
+  const byId = (id: string) => info.accounts.find(a => a.account === id)
+  const head = (
+    <Text bold>{`Move "${session.title || 'this session'}" from ${accountLabel(byId(session.account), session.account)}`}</Text>
+  )
+  const status = busy ? <Text dimColor>{busy}</Text> : null
+
+  if (info.pending) {
+    const to = accountLabel(byId(info.pending.to.account), info.pending.to.account)
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        {head}
+        <Text>{`Copied to ${to}. The move finishes once this session is archived here; then switch the app to ${to} and open it there.`}</Text>
+        <Box flexDirection="row" columnGap={1}>
+          <Button key="move-archive" label="Archive here now" onPress={() => void archiveHere($, to)} />
+          <Button key="move-cancel" label="Cancel move" onPress={() => act($, cancelMove($))} />
+        </Box>
+        {status}
+      </Box>
+    )
+  }
+  if (info.blocked) {
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        {head}
+        <Text color="warning">{info.blocked}</Text>
+      </Box>
+    )
+  }
+  const others = info.accounts.filter(a => a.account !== session.account)
+  if (!others.length) {
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        {head}
+        <Text dimColor>No other account has used the Claude app on this computer.</Text>
+      </Box>
+    )
+  }
+  const pick = byId((await read($, moveTo)) ?? '') ?? others[0]!
+  const now = await $.clock.now()
+  return (
+    <Box flexDirection="column" rowGap={1}>
+      {head}
+      <Select
+        key="move-to"
+        label="To "
+        options={others.map(a => ({ value: a.account, label: `${accountLabel(a)} · ${accountDetail(a, now)}` }))}
+        value={pick.account}
+        onSelect={v => void update($, moveTo, () => v)}
+      />
+      <Input
+        key={`move-name-${pick.account}`}
+        label="Name this account "
+        value={pick.name ?? ''}
+        placeholder={pick.email ?? 'a name to tell it apart'}
+        onSubmit={v => act($, nameAccount($, pick.account, v))}
+      />
+      <Text dimColor>{MOVE_NOTE}</Text>
+      {working ? <Text color="warning">Stop the current turn first: a session moves once it is stopped.</Text> : null}
+      {working || busy ? null : (
+        <Button key="move-go" label={`Move to ${accountLabel(pick)}`} onPress={() => void startMove($)} />
+      )}
+      {status}
+    </Box>
+  )
+}
+
+// The band's Move session button, for a session the app has a record of.
+async function moveButton($: EngineInterface, { Button }: Elements['terminal']) {
+  const info = showMove ? await read($, moveNow) : null
+  if (!info?.session) return null
+  const shown = (await read($, moveOpen)) || (await paneOpen($, MOVE_PANE))
+  const label = shown ? 'Hide move' : info.pending ? 'Move pending' : 'Move session'
+  return <Button key="move" label={label} onPress={() => void toggleMove($)} />
 }
 
 // The status, bold in the theme's text color, then the buttons in
@@ -522,6 +959,7 @@ function failed(_$: unknown, _e: unknown, next: { error?: { message?: string } }
 export const register: Register = (on, options) => {
   showStatus = options.status_line !== false
   showControls = options.controls !== false
+  showMove = options.move_button !== false
 
   on('session.start', async ($, e, next) => {
     diag.loaded = `${new Date(await $.clock.now()).toISOString()} from ${$.plugin.root}`
@@ -530,6 +968,8 @@ export const register: Register = (on, options) => {
     // update, so a late write failing there is dropped, not reported.
     void refreshStatus($).catch(() => {})
     void optionRows($).catch(() => {}) // records which pluginConfigs entry is live
+    // Whether the app has a record of this session, for the Move button.
+    if (showMove) void loadMove($).catch(() => {})
     $.clock.every(STATUS_EVERY_MS, () => void refreshStatus($))
     if (!showStatus) $.ui.status(undefined)
     // /roll is the plugin's only command. A name another command already
@@ -552,8 +992,22 @@ export const register: Register = (on, options) => {
     .catch(failed)
 
   // A turn may have triggered a compression; show it without waiting 30 s.
+  // The main loop's turns also say whether the session is stopped, which a
+  // move waits for; the pane redraws to say so.
   on('turn.complete', async ($, e, next) => {
     void refreshStatus($).catch(() => {})
+    if ((e as { agentId?: string }).agentId === undefined && working) {
+      working = false
+      $.ui.invalidate('ui.render')
+    }
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if ((e as { agentId?: string }).agentId === undefined && !working) {
+      working = true
+      $.ui.invalidate('ui.render')
+    }
     return next(e)
   })
 
@@ -587,12 +1041,18 @@ export const register: Register = (on, options) => {
     return settingsBody($, els, settings)
   })
 
-  // The pane can close without the Settings button (Esc, its close mark, or
-  // the engine dropping it): pass the close on, then redraw so the button
-  // says "Settings" again. A hook that answers without `next` would keep the
-  // pane open, so the close always passes through.
+  on('ui.render', { component: 'Pane', requestId: MOVE_PANE }, async ($, e, next) => {
+    seen($, e)
+    if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
+    return moveBody($, $.ui.resolve(e) as Elements['terminal'])
+  })
+
+  // A pane can close without its button (Esc, its close mark, or the engine
+  // dropping it): pass the close on, then redraw so the button says
+  // "Settings" or "Move session" again. A hook that answers without `next`
+  // would keep the pane open, so the close always passes through.
   on('ui.close', async ($, e, next) => {
-    if (e.id !== PANE) return next(e)
+    if (e.id !== PANE && e.id !== MOVE_PANE) return next(e)
     const out = await next(e)
     $.ui.invalidate('ui.render')
     return out
@@ -609,15 +1069,21 @@ export const register: Register = (on, options) => {
     seen($, e)
     if (e.props.hasSurvey) return next(e)
     if (e.surface !== 'terminal' && e.surface !== 'desktop') return next(e)
+    // The band is redrawn as a turn starts and ends: the freshest word on it.
+    working = e.props.isWorking
     const els = $.ui.resolve(e) as Elements['terminal']
     const row = !rowDrawn && showControls
     const settings = (await read($, isOpen)) ? await read($, settingsNow) : null
-    if (!row && !settings) return next(e)
+    const move = await moveButton($, els)
+    const moveShown = await read($, moveOpen)
+    if (!row && !settings && !move && !moveShown) return next(e)
     const theirs = await next(e)
     const { Box, Button, Text } = els
     const now = row ? await read($, healthNow) : null // not `h`: that is the JSX factory
     const toggle = row ? toggleAction(now) : null
     const shown = row ? (await read($, isOpen)) || (await paneOpen($)) : false
+    // Move session sits at the end of the RC line, or on a line of its own
+    // where the row under the prompt holds the RC buttons.
     return (
       <Box flexDirection="column">
         {theirs}
@@ -633,9 +1099,13 @@ export const register: Register = (on, options) => {
               label={shown ? 'Hide settings' : 'Settings'}
               onPress={() => toggleSettings($)}
             />
+            {move}
           </Box>
+        ) : move ? (
+          <Box flexDirection="row">{move}</Box>
         ) : null}
         {settings ? settingsBody($, els, settings) : null}
+        {moveShown ? await moveBody($, els) : null}
       </Box>
     )
   })

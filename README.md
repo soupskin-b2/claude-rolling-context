@@ -300,6 +300,60 @@ honours one in real slash-command output, but a state file wins over it, and a
 marker merely quoted inside a tool result (reading this plugin's source, say)
 no longer toggles anything.
 
+## Moving a session to another account
+
+In the Claude desktop app, **Move session** (above the prompt, at the end of
+the RC line) moves the current Code session to another account that has used
+the app on this computer. Pick the account, press **Move to …**, and approve
+the app's archive card. The session is archived here, so its CLI stops, and
+it is listed under the other account. Switch the app to that account and open
+it there. If it is missing from the list, restart the app.
+
+The app files each session under its account, in
+`claude-code-sessions/<account>/<org>/local_<id>.json` in its data folder,
+and that record is the only thing tied to the account. The transcript
+(`~/.claude/projects/…`), the scratchpad, this plugin's per-session switch
+and its stored compressions are machine-wide and keyed by the CLI session id
+or by content, so the move keeps that id and leaves them where they are. The
+session carries on exactly where it was, compressions included.
+
+- The record is copied into the target account. It takes that account's
+  connectors and drops what was bound to the old one, such as Remote Control
+  links and tool snapshots. The record and transcript are backed up first, in
+  `~/.claude/rolling-context-moves/backups/` (the newest 10 moves).
+- A detached helper waits for the archive. Then it removes the old record the
+  way the app's own delete does, without touching the transcript, which the
+  moved session still uses. Until then the pane offers **Cancel move**. If
+  the archive card is declined, archiving the session from the sidebar still
+  finishes the move.
+- Only a stopped session moves. A session in a worktree doesn't, because
+  archiving it would delete the worktree.
+- Accounts are named by their email where a `.claude.json` on this computer
+  knows it, and otherwise by their latest session. **Name this account** gives
+  one a name of your own.
+- **Don't Delete the old copy from the source account's Archived list** if the
+  app still shows it before a restart. The app's Delete removes the
+  transcript, and the moved session shares it.
+
+**Import from another account**, lower in the same pane, works the other way.
+Pick an account to see its sessions (live ones first; **Show archived** adds
+the rest), pick one, and press **Import "…"**. It moves into the account this
+session is in right away. Only the signed-in account runs sessions, so there
+is nothing to stop or archive first. The record is backed up, copied in with
+this account's connectors, and removed from the other account the way the
+app's delete removes it. An archived session comes in live. A session whose
+transcript isn't on this computer can't be imported. The mod then opens the
+app's resume link (`claude://resume?session=<id>`), so the app lists and opens
+the session at once, with no restart; its title is put back if the app named
+it differently. Like any resume link, this trusts the session's folder in the
+app. The session's id in this account becomes `local_<CLI session id>`, the id
+the app gives a session it adopts. In a terminal, or if the app doesn't pick it
+up, it is listed after the app's next restart.
+
+`proxy/move_session.py` does the work and logs to
+`~/.claude/rolling-context-moves/moves.log`. **Show Move session** in
+`/config` hides the button.
+
 ## Configuration
 
 The everyday settings are rows in **`/config`**, under rolling-context. The
@@ -312,6 +366,7 @@ restart:
 | Recent context kept verbatim (tokens) | `40000` | The target; kept below the trigger |
 | Delete unused compressions after | `14 days` | 1 hour to 30 days, or Never. A compression not injected into any request for this long is deleted from memory and from disk |
 | Show status line | on | The line under the prompt |
+| Show Move session | on | The Move session button above the prompt (desktop app) |
 
 A value set in `/config` wins over the matching environment variable below.
 
