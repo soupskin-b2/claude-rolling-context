@@ -300,11 +300,51 @@ honours one in real slash-command output, but a state file wins over it, and a
 marker merely quoted inside a tool result (reading this plugin's source, say)
 no longer toggles anything.
 
+## Switching accounts without signing in again
+
+**Sessions** (above the prompt, at the end of the RC line) opens with
+**Switch account**. Pick an account and press **Switch to …**. The Claude app
+quits, comes back signed in to that account, and asks for no email code or
+browser sign-in.
+
+The app keeps its login in two places in its data folder: the claude.ai
+cookies (`Network/Cookies`) and three keys of `config.json`
+(`oauth:tokenCache`, `oauth:tokenCacheV2` and `lastKnownAccountUuid`).
+Everything else there is either the machine's or already kept per account. A
+switch saves the outgoing account's login in
+`~/.claude/rolling-context-logins/<account>/`, puts the chosen account's saved
+login in its place, and starts the app again. The cookie values and token
+caches are encrypted with a key of this OS user (DPAPI on Windows, the
+keychain on macOS), so a saved login works only for this user on this
+computer.
+
+- An account with no saved login says **sign in once**. Switching to it (or
+  to **Another account (sign in)**) starts the app signed out. Sign in as
+  usual; the next switch away from it saves that login.
+- **Don't use the app's own Log out** for an account you want to come back to.
+  Logging out ends that login on the server, so the saved copy stops working
+  too. Switch here instead.
+- Switching restarts the app, so sessions that are working stop. A switch
+  waits for this session's turn to end. The app is asked to quit and is ended
+  outright after 10 seconds. A detached helper
+  (`proxy/switch_account.py run`) does the swap, because this session's CLI
+  ends with the app. It logs to `~/.claude/rolling-context-logins/switch.log`.
+- A signed-out app saves nothing. A saved login is never replaced by one
+  without a claude.ai session cookie.
+- **Forget saved login** deletes one.
+- **Move and switch to it**, next to **Move to …**, moves this session and
+  switches the app to the account it went to once the move has finished. The
+  moved session is waiting in the sidebar there. It needs a saved login for
+  that account.
+- On Windows the app relaunches through its Store package
+  (`shell:AppsFolder\Claude_…!Claude`) or its exe, on macOS through its
+  `.app`. Only Windows has been tried with the real app.
+
 ## Moving a session to another account
 
-In the Claude desktop app, **Move session** (above the prompt, at the end of
-the RC line) moves the current Code session to another account that has used
-the app on this computer. Pick the account, press **Move to …**, and approve
+In the Claude desktop app, **Sessions** (above the prompt, at the end of the
+RC line) opens a pane that moves the current Code session to another account
+that has used the app on this computer, or imports one from it. Pick the account, press **Move to …**, and approve
 the app's archive card. The session is archived here, so its CLI stops, and
 it is listed under the other account. Switch the app to that account and open
 it there. If it is missing from the list, restart the app.
@@ -351,7 +391,7 @@ the app gives a session it adopts. In a terminal, or if the app doesn't pick it
 up, it is listed after the app's next restart.
 
 `proxy/move_session.py` does the work and logs to
-`~/.claude/rolling-context-moves/moves.log`. **Show Move session** in
+`~/.claude/rolling-context-moves/moves.log`. **Show Sessions** in
 `/config` hides the button.
 
 ## Configuration
@@ -366,7 +406,7 @@ restart:
 | Recent context kept verbatim (tokens) | `40000` | The target; kept below the trigger |
 | Delete unused compressions after | `14 days` | 1 hour to 30 days, or Never. A compression not injected into any request for this long is deleted from memory and from disk |
 | Show status line | on | The line under the prompt |
-| Show Move session | on | The Move session button above the prompt (desktop app) |
+| Show Sessions | on | The Sessions button above the prompt (desktop app) |
 
 A value set in `/config` wins over the matching environment variable below.
 

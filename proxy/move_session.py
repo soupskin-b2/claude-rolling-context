@@ -112,6 +112,20 @@ def names_path():
     return os.path.join(claude_dir(), "rolling-context-accounts.json")
 
 
+def logins_dir():
+    """Where switch_account.py keeps each account's saved app login."""
+    return os.path.join(claude_dir(), "rolling-context-logins")
+
+
+def has_login(account):
+    return os.path.isfile(os.path.join(logins_dir(), account, "login.json"))
+
+
+def signed_in():
+    """The account the desktop app is signed in to, as its config.json says."""
+    return (read_json(os.path.join(app_dir(), "config.json"), {}) or {}).get("lastKnownAccountUuid")
+
+
 def bare(local_id):
     return local_id[len("local_"):] if local_id.startswith("local_") else local_id
 
@@ -252,6 +266,7 @@ def accounts():
             "latestTitle": latest[1] if latest else None,
             "latestAt": latest[0][1] if latest else None,
             "latestArchived": bool(latest) and not latest[0][0],
+            "login": has_login(account),
         })
     return out
 
@@ -368,6 +383,7 @@ def describe(cli_id):
             "transcript": transcript(cli_id),
         },
         "accounts": accounts(),
+        "signedIn": signed_in(),
         "pending": st,
         "blocked": blocked,
     }

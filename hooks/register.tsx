@@ -19,7 +19,7 @@
 // The status line under the prompt always carries the status, and the row,
 // the band and the settings read the proxy's /health for this session.
 //
-// Move session, in the band, moves a stopped desktop app session to another
+// Sessions, in the band, opens a pane that moves a stopped desktop app session to another
 // account signed in on this computer (proxy/move_session.py says how, and why
 // the transcript, scratchpad and compressions need nothing moved). Its pane
 // also imports: it lists another account's sessions and moves the one picked
@@ -71,7 +71,7 @@ const isOpen = atom({ plugin: 'rolling-context', key: 'isOpen' } as const, false
 const settingsNow = atom({ plugin: 'rolling-context', key: 'settings' } as const, null)
 const busyNow = atom({ plugin: 'rolling-context', key: 'busy' } as const, null)
 const ctxNow = atom({ plugin: 'rolling-context', key: 'ctx' } as const, null)
-// The Move session pane's: the accounts answer, its fallback box, the pick
+// The Sessions pane's: the accounts answer, its fallback box, the pick
 // and what a move in progress says.
 const moveNow = atom({ plugin: 'rolling-context', key: 'move' } as const, null)
 const moveOpen = atom({ plugin: 'rolling-context', key: 'moveOpen' } as const, false)
@@ -84,6 +84,10 @@ const importList = atom({ plugin: 'rolling-context', key: 'importList' } as cons
 const importPick = atom({ plugin: 'rolling-context', key: 'importPick' } as const, null)
 const importArchived = atom({ plugin: 'rolling-context', key: 'importArchived' } as const, false)
 const importBusy = atom({ plugin: 'rolling-context', key: 'importBusy' } as const, null)
+// Its Switch account section's: the account picked and what it says while a
+// switch starts.
+const switchTo = atom({ plugin: 'rolling-context', key: 'switchTo' } as const, null)
+const switchBusy = atom({ plugin: 'rolling-context', key: 'switchBusy' } as const, null)
 
 const compact = (n: number) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n)
@@ -552,7 +556,9 @@ async function archiveHere($: EngineInterface, label: string) {
     'archive this session from the sidebar to finish, or Cancel move')
 }
 
-async function startMove($: EngineInterface) {
+// With andSwitch, the app then switches to the account the session went to:
+// switch_account.py waits for the move to finish before it quits the app.
+async function startMove($: EngineInterface, andSwitch = false) {
   const info = await read($, moveNow)
   const to = await read($, moveTo)
   const pick = info?.accounts.find(a => a.account === to)
@@ -561,8 +567,15 @@ async function startMove($: EngineInterface) {
   const label = accountLabel(pick)
   await update($, moveBusy, () => `copying it to ${label}…`)
   try {
-    const out = await moveScript($, ['prepare', '--session', await $.session.id(), '--to', pick.account])
+    const id = await $.session.id()
+    const out = await moveScript($, ['prepare', '--session', id, '--to', pick.account])
     if (!out.ok) return $.ui.toast(`Not moved: ${String(out.error ?? 'move_session.py refused')}`)
+    if (andSwitch) {
+      const sw = await switchScript($, ['switch', '--to', pick.account, '--after-move', id])
+      $.ui.toast(sw.ok
+        ? `Once it is archived here, the Claude app restarts signed in to ${label}`
+        : `Moving without switching: ${String(sw.error ?? 'switch_account.py refused')}`)
+    }
     await loadMove($)
     await update($, moveBusy, () => `archiving it here so ${label} can open it…`)
     $.ui.toast(`Copied to ${label}; archiving it here finishes the move`)
@@ -578,6 +591,125 @@ async function cancelMove($: EngineInterface) {
   const out = await moveScript($, ['cancel', '--session', await $.session.id()])
   await loadMove($)
   return out.ok ? 'Move cancelled: the copy in the other account is gone' : String(out.error)
+}
+
+// ---- Switch account --------------------------------------------------------
+
+// switch_account.py's answer, as moveScript reads move_session.py's.
+async function switchScript($: EngineInterface, args: string[]): Promise<Record<string, unknown>> {
+  const r = await runPython(
+    $, [`${$.plugin.root}/proxy/switch_account.py`, ...args], { PYTHONIOENCODING: 'utf-8' },
+  )
+  try {
+    return JSON.parse(r.stdout) as Record<string, unknown>
+  } catch {
+    throw new Error(clean(r.stderr) || clean(r.stdout) || `switch_account.py exited ${r.exitCode}`)
+  }
+}
+
+const NEW_ACCOUNT = 'new'
+
+// The account the app is signed in to: as its config.json says, else this
+// session's.
+const signedIn = (info: Move) => info.signedIn ?? info.session?.account ?? null
+
+// What Switch account offers: every other account, then signing in to one
+// it has not seen.
+function switchChoices(info: Move) {
+  const here = signedIn(info)
+  return info.accounts.filter(a => a.account !== here)
+}
+
+async function switchPick($: EngineInterface, info: Move) {
+  const choices = switchChoices(info)
+  const cur = await read($, switchTo)
+  if (cur === NEW_ACCOUNT || choices.some(a => a.account === cur)) return cur!
+  return choices.find(a => a.login)?.account ?? choices[0]?.account ?? NEW_ACCOUNT
+}
+
+// Starts the detached switch and returns: the app quits within moments,
+// taking this session's CLI with it.
+async function startSwitch($: EngineInterface) {
+  const info = await read($, moveNow)
+  if (!info) return
+  if (working) return $.ui.toast('Stop the current turn first: switching restarts the Claude app')
+  const pick = await switchPick($, info)
+  const acct = info.accounts.find(a => a.account === pick)
+  const saved = !!acct?.login
+  const label = acct ? accountLabel(acct) : 'another account'
+  await update($, switchBusy, () => (saved ? `switching to ${label}…` : 'signing the app out…'))
+  try {
+    const out = await switchScript($, ['switch', '--to', saved ? pick : NEW_ACCOUNT])
+    if (!out.ok) return $.ui.toast(`Not switched: ${String(out.error ?? 'switch_account.py refused')}`)
+    $.ui.toast(saved
+      ? `The Claude app restarts signed in to ${label}`
+      : `The Claude app restarts signed out: sign in to ${label}`)
+  } catch (err) {
+    $.ui.toast(`Switch account: ${String(err)}`)
+  } finally {
+    await update($, switchBusy, () => null).catch(() => {}) // the app may be quitting
+  }
+}
+
+async function forgetLogin($: EngineInterface, account: string) {
+  const out = await switchScript($, ['forget', '--account', account])
+  await loadMove($)
+  return out.ok ? 'Saved login forgotten' : String(out.error)
+}
+
+const SWITCH_NOTE =
+  'Switching restarts the Claude app: sessions that are working stop. The login of the account ' +
+  'it leaves is saved first, so switching back needs no sign-in. Signing out in the app ends a ' +
+  'saved login too, so switch here instead. Logins are saved in ~/.claude/rolling-context-logins ' +
+  'and work only for this user on this computer.'
+
+async function switchSection(
+  $: EngineInterface,
+  { Box, Button, Select, Text }: Elements['terminal'],
+  info: Move,
+) {
+  const here = signedIn(info)
+  const hereAcct = info.accounts.find(a => a.account === here)
+  const choices = switchChoices(info)
+  const pick = await switchPick($, info)
+  const acct = choices.find(a => a.account === pick)
+  const busy = await read($, switchBusy)
+  const now = await $.clock.now()
+  const label = acct ? accountLabel(acct) : ''
+  const go = !acct ? 'Sign in to another account' : acct.login ? `Switch to ${label}` : `Sign in to ${label}`
+  return (
+    <Box flexDirection="column" rowGap={1}>
+      <Text bold>Switch account</Text>
+      <Text>{`Signed in to ${here ? accountLabel(hereAcct, here) : 'no account'}`}</Text>
+      <Select
+        key="switch-to"
+        label="To "
+        options={[
+          ...choices.map(a => ({
+            value: a.account,
+            label: `${accountLabel(a)} · ${a.login ? 'login saved' : 'sign in once'} · ${accountDetail(a, now)}`,
+          })),
+          { value: NEW_ACCOUNT, label: 'Another account (sign in)' },
+        ]}
+        value={pick}
+        onSelect={v => void update($, switchTo, () => v)}
+      />
+      {acct && !acct.login ? (
+        <Text dimColor>
+          {`No login of ${label} is saved yet: the app restarts signed out, you sign in to it once, and from then on it switches without signing in.`}
+        </Text>
+      ) : null}
+      <Text dimColor>{SWITCH_NOTE}</Text>
+      {working ? <Text color="warning">Stop the current turn first: switching restarts the Claude app.</Text> : null}
+      <Box flexDirection="row" columnGap={1}>
+        {working || busy ? null : <Button key="switch-go" label={go} onPress={() => void startSwitch($)} />}
+        {acct?.login && !busy ? (
+          <Button key="switch-forget" label="Forget saved login" onPress={() => act($, forgetLogin($, acct.account))} />
+        ) : null}
+      </Box>
+      {busy ? <Text dimColor>{busy}</Text> : null}
+    </Box>
+  )
 }
 
 // ---- Import from another account -------------------------------------------
@@ -768,11 +900,11 @@ async function toggleMove($: EngineInterface) {
   try {
     await loadMove($)
   } catch (err) {
-    return $.ui.toast(`Move session: ${String(err)}`)
+    return $.ui.toast(`Sessions: ${String(err)}`)
   }
   void loadImport($).catch(err => $.ui.toast(`Import: ${String(err)}`))
   const opened = await $.ui.open({
-    id: MOVE_PANE, title: 'Move session', focus: true, closeOnEscape: true, rows: 20,
+    id: MOVE_PANE, title: 'Sessions', focus: true, closeOnEscape: true, rows: 20,
   })
   $.ui.invalidate('ui.render')
   if (!opened.isPlaced) {
@@ -782,12 +914,13 @@ async function toggleMove($: EngineInterface) {
 }
 
 const MOVE_NOTE =
-  'It is archived here and listed under that account: switch the Claude app to it and open ' +
-  'the session. The transcript, scratchpad and rolling-context compressions stay on this ' +
-  'computer under the same session id, so it carries on where it left off.'
+  'It is archived here and listed under that account: switch the Claude app to it (Switch ' +
+  'account above, or Move and switch) and open it there. The transcript, scratchpad and ' +
+  'rolling-context compressions stay on this computer under the same session id, so it ' +
+  'carries on where it left off.'
 
-// Moving this session away, then importing one from another account, then
-// Close.
+// Switching the app's account, moving this session away, then importing one
+// from another account, then Close.
 async function moveBody($: EngineInterface, el: Elements['terminal']) {
   const { Box, Button, Text } = el
   const info = await read($, moveNow)
@@ -797,6 +930,7 @@ async function moveBody($: EngineInterface, el: Elements['terminal']) {
   const others = info.accounts.filter(a => a.account !== session.account)
   return (
     <Box flexDirection="column" rowGap={1}>
+      {await switchSection($, el, info)}
       {await moveSection($, el, info, session)}
       {others.length ? await importSection($, el, others) : null}
       <Button key="move-close" label="Close" onPress={() => void toggleMove($)} />
@@ -870,19 +1004,24 @@ async function moveSection(
       <Text dimColor>{MOVE_NOTE}</Text>
       {working ? <Text color="warning">Stop the current turn first: a session moves once it is stopped.</Text> : null}
       {working || busy ? null : (
-        <Button key="move-go" label={`Move to ${accountLabel(pick)}`} onPress={() => void startMove($)} />
+        <Box flexDirection="row" columnGap={1}>
+          <Button key="move-go" label={`Move to ${accountLabel(pick)}`} onPress={() => void startMove($)} />
+          {pick.login ? (
+            <Button key="move-switch" label="Move and switch to it" onPress={() => void startMove($, true)} />
+          ) : null}
+        </Box>
       )}
       {status}
     </Box>
   )
 }
 
-// The band's Move session button, for a session the app has a record of.
+// The band's Sessions button, for a session the app has a record of.
 async function moveButton($: EngineInterface, { Button }: Elements['terminal']) {
   const info = showMove ? await read($, moveNow) : null
   if (!info?.session) return null
   const shown = (await read($, moveOpen)) || (await paneOpen($, MOVE_PANE))
-  const label = shown ? 'Hide move' : info.pending ? 'Move pending' : 'Move session'
+  const label = shown ? 'Hide sessions' : info.pending ? 'Sessions (move pending)' : 'Sessions'
   return <Button key="move" label={label} onPress={() => void toggleMove($)} />
 }
 
@@ -1049,7 +1188,7 @@ export const register: Register = (on, options) => {
 
   // A pane can close without its button (Esc, its close mark, or the engine
   // dropping it): pass the close on, then redraw so the button says
-  // "Settings" or "Move session" again. A hook that answers without `next`
+  // "Settings" or "Sessions" again. A hook that answers without `next`
   // would keep the pane open, so the close always passes through.
   on('ui.close', async ($, e, next) => {
     if (e.id !== PANE && e.id !== MOVE_PANE) return next(e)
@@ -1082,7 +1221,7 @@ export const register: Register = (on, options) => {
     const now = row ? await read($, healthNow) : null // not `h`: that is the JSX factory
     const toggle = row ? toggleAction(now) : null
     const shown = row ? (await read($, isOpen)) || (await paneOpen($)) : false
-    // Move session sits at the end of the RC line, or on a line of its own
+    // Sessions sits at the end of the RC line, or on a line of its own
     // where the row under the prompt holds the RC buttons.
     return (
       <Box flexDirection="column">

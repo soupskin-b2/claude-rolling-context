@@ -1,6 +1,7 @@
-// Tests for Move session in hooks/register.tsx, run by `claude plugin test`.
-// move_session.py and the app's archive_session are answered beneath the mod;
-// proxy/move_session.py's own behaviour is tests/test_move_session.py's.
+// Tests for the Sessions pane in hooks/register.tsx, run by `claude plugin test`.
+// move_session.py, switch_account.py and the app's archive_session are
+// answered beneath the mod; the scripts' own behaviour is
+// tests/test_move_session.py's and tests/test_switch_account.py's.
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
@@ -20,9 +21,10 @@ function accounts(over: Info = {}): Info {
     },
     accounts: [
       { account: HERE, org: 'o1', email: 'me@example.com', name: null, sessions: 3, latestTitle: 'The session', latestAt: 0 },
-      { account: WORK, org: 'o2', email: 'work@example.com', name: null, sessions: 2, latestTitle: 'Bot', latestAt: 0 },
+      { account: WORK, org: 'o2', email: 'work@example.com', name: null, sessions: 2, latestTitle: 'Bot', latestAt: 0, login: true },
       { account: OLD, org: 'o3', email: null, name: null, sessions: 0, latestTitle: 'Gone', latestAt: 0, latestArchived: true },
     ],
+    signedIn: HERE,
     pending: null,
     blocked: null,
     ...over,
@@ -51,11 +53,13 @@ function lists(): Record<string, Info[]> {
 // move_session.py answers by its verb; `info` is what `accounts` says now.
 function world(on: On, first: Info = accounts(), archive: { isError: boolean; text: string } = { isError: false, text: 'Archived' }) {
   const runs: string[][] = []
+  const switches: string[][] = []
   const calls: { server: string; tool: string; args: Record<string, unknown> }[] = []
   const toasts: string[] = []
   const state = {
     info: first, lists: lists(),
     importAnswer: { ok: true, imported: { localId: 'local_cli-w1', opened: true } } as Info,
+    switchAnswer: { ok: true } as Info,
     // What the app's get_session says of the imported session: listed, under its transcript's name.
     adopted: { isError: false, text: JSON.stringify({ sessionId: 'local_cli-w1', title: 'hello there' }) },
   }
@@ -68,6 +72,10 @@ function world(on: On, first: Info = accounts(), archive: { isError: boolean; te
     const script = e.argv[1] ?? ''
     const args = e.argv.slice(2)
     let out: Info = { ok: true }
+    if (script.endsWith('switch_account.py')) {
+      switches.push([...args])
+      if (args[0] === 'switch') out = state.switchAnswer
+    }
     if (script.endsWith('move_session.py')) {
       runs.push([...args])
       if (args[0] === 'accounts') out = state.info
@@ -110,7 +118,7 @@ function world(on: On, first: Info = accounts(), archive: { isError: boolean; te
   })
   on('ui.panes', async () => ({ value: [...open].map(id => ({ id, title: id })) }))
   on('ui.render', async ($, e) => h($.ui.resolve(e).Box, {})) // the engine's own band: empty
-  return { runs, calls, toasts, open, state, clock }
+  return { runs, switches, calls, toasts, open, state, clock }
 }
 
 type T = Parameters<Parameters<typeof test>[1]>[0]
@@ -133,17 +141,17 @@ const band = ($: T, isWorking = false) => $.ui.mount({
 
 const pane = ($: T) => $.ui.mount({
   plugin: 'rolling-context', surface: 'desktop', component: 'Pane', requestId: 'move',
-  props: { title: 'Move session', bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  props: { title: 'Sessions', bodyColumns: 100, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as Parameters<typeof $.ui.mount>[0])
 
-describe('Move session', () => {
+describe('Sessions', () => {
   test('sits at the end of the RC line in a session the app has a record of', async ($, on) => {
     const w = world(on)
     await start($, on)
     await w.clock.settle()
     const b = await band($)
     expect((await b.find({ key: 'settings' }))?.text).toMatch(/Settings/)
-    expect((await b.find({ key: 'move' }))?.text).toBe('Move session')
+    expect((await b.find({ key: 'move' }))?.text).toBe('Sessions')
     expect(w.runs[0]).toEqual(['accounts', '--session', SESSION])
   })
 
@@ -164,7 +172,7 @@ describe('Move session', () => {
     await settle(w)
     expect(w.open.has('move')).toBe(true)
     await b.redraw()
-    expect((await b.find({ key: 'move' }))?.text).toBe('Hide move')
+    expect((await b.find({ key: 'move' }))?.text).toBe('Hide sessions')
 
     const p = await pane($)
     const to = await p.find({ key: 'move-to' })
@@ -214,7 +222,7 @@ describe('Move session', () => {
     await p.redraw()
     expect((await p.find({ type: 'Text', text: /^Copied to work@example\.com\. The move finishes/ }))).toBeDefined()
     await b.redraw()
-    expect((await b.find({ key: 'move' }))?.text).toBe('Hide move')
+    expect((await b.find({ key: 'move' }))?.text).toBe('Hide sessions')
     await p.press({ key: 'move-cancel' })
     await settle(w)
     expect(w.runs.at(-2)).toEqual(['cancel', '--session', SESSION])
@@ -348,5 +356,93 @@ describe('Move session', () => {
     await p.input({ key: `move-name-${WORK}`, text: 'Work' })
     await settle(w)
     expect(w.runs.find(r => r[0] === 'name')).toEqual(['name', '--account', WORK, '--name', 'Work'])
+  })
+})
+
+describe('Switch account', () => {
+  async function open($: T, on: On, first: Info = accounts(), isWorking = false) {
+    const w = world(on, first)
+    await start($, on)
+    await w.clock.settle()
+    const b = await band($, isWorking)
+    await b.press({ key: 'move' })
+    await settle(w)
+    return { w, p: await pane($) }
+  }
+
+  test('says which account the app is in and offers the others, a saved login first', async ($, on) => {
+    const { w, p } = await open($, on)
+    expect(await p.find({ type: 'Text', text: 'Signed in to me@example.com' })).toBeDefined()
+    const to = await p.find({ key: 'switch-to' })
+    const options = (to?.props.options ?? []) as { value: string; label: string }[]
+    expect(options.map(o => o.value)).toEqual([WORK, OLD, 'new'])
+    expect(options[0]!.label).toMatch(/^work@example\.com · login saved · 2 sessions/)
+    expect(options[1]!.label).toMatch(/^Account cccccccc · sign in once · /)
+    expect(options[2]!.label).toBe('Another account (sign in)')
+    expect(to?.props.value).toBe(WORK)
+    expect((await p.find({ key: 'switch-go' }))?.text).toBe('Switch to work@example.com')
+
+    await p.press({ key: 'switch-go' })
+    await settle(w)
+    expect(w.switches).toEqual([['switch', '--to', WORK]])
+    expect(w.toasts.at(-1)).toBe('The Claude app restarts signed in to work@example.com')
+  })
+
+  test('an account with no saved login is signed in to once, from a signed-out app', async ($, on) => {
+    const { w, p } = await open($, on)
+    await p.select({ key: 'switch-to', value: OLD })
+    expect((await p.find({ key: 'switch-go' }))?.text).toBe('Sign in to Account cccccccc')
+    expect(await p.find({ type: 'Text', text: /No login of Account cccccccc is saved yet/ })).toBeDefined()
+    expect(await p.find({ key: 'switch-forget' })).toBeUndefined()
+    await p.press({ key: 'switch-go' })
+    await settle(w)
+    expect(w.switches).toEqual([['switch', '--to', 'new']])
+    expect(w.toasts.at(-1)).toBe('The Claude app restarts signed out: sign in to Account cccccccc')
+
+    await p.select({ key: 'switch-to', value: 'new' })
+    expect((await p.find({ key: 'switch-go' }))?.text).toBe('Sign in to another account')
+  })
+
+  test('the signed-in account is left out even when this session is filed under another', async ($, on) => {
+    const { p } = await open($, on, accounts({ signedIn: WORK }))
+    expect(await p.find({ type: 'Text', text: 'Signed in to work@example.com' })).toBeDefined()
+    const options = (await p.find({ key: 'switch-to' }))?.props.options as { value: string }[]
+    expect(options.map(o => o.value)).toEqual([HERE, OLD, 'new'])
+  })
+
+  test('waits while a turn runs', async ($, on) => {
+    const { w, p } = await open($, on, accounts(), true)
+    expect(await p.find({ key: 'switch-go' })).toBeUndefined()
+    expect(w.switches).toEqual([])
+  })
+
+  test('a switch switch_account.py refuses says why', async ($, on) => {
+    const { w, p } = await open($, on)
+    w.state.switchAnswer = { ok: false, error: 'This session is not running in the Claude desktop app.' }
+    await p.press({ key: 'switch-go' })
+    await settle(w)
+    expect(w.toasts.at(-1)).toBe('Not switched: This session is not running in the Claude desktop app.')
+  })
+
+  test('a saved login can be forgotten', async ($, on) => {
+    const { w, p } = await open($, on)
+    await p.press({ key: 'switch-forget' })
+    await settle(w)
+    expect(w.switches).toEqual([['forget', '--account', WORK]])
+    expect(w.toasts.at(-1)).toBe('Saved login forgotten')
+  })
+
+  test('Move and switch moves, then has the switch wait for the move', async ($, on) => {
+    const { w, p } = await open($, on)
+    await p.select({ key: 'move-to', value: OLD })              // no saved login: nothing to switch to
+    expect(await p.find({ key: 'move-switch' })).toBeUndefined()
+    await p.select({ key: 'move-to', value: WORK })
+    await p.press({ key: 'move-switch' })
+    await settle(w)
+    expect(w.runs.find(r => r[0] === 'prepare')).toEqual(['prepare', '--session', SESSION, '--to', WORK])
+    expect(w.switches).toEqual([['switch', '--to', WORK, '--after-move', SESSION]])
+    expect(w.calls.map(c => c.tool)).toEqual(['archive_session'])
+    expect(w.toasts[0]).toBe('Once it is archived here, the Claude app restarts signed in to work@example.com')
+
   })
 })

@@ -26,12 +26,14 @@ export type RollingContextAccount = {
   account: string
   org: string | null
   email: string | null
-  /** The nickname given in the Move session pane. */
+  /** The nickname given in the Sessions pane. */
   name: string | null
   sessions: number
   latestTitle: string | null
   latestAt: number | null
   latestArchived?: boolean
+  /** Whether switch_account.py has a saved app login for it. */
+  login?: boolean
 }
 
 /** A move that waits for this session to be archived in the account it leaves. */
@@ -57,6 +59,8 @@ export type RollingContextMove = {
     transcript: string | null
   } | null
   accounts: RollingContextAccount[]
+  /** The account the desktop app is signed in to (its config.json), else null. */
+  signedIn?: string | null
   pending: RollingContextPendingMove | null
   /** Why this session cannot move, else null. */
   blocked: string | null
@@ -93,15 +97,19 @@ declare module 'claude-code' {
       busy: string | null
       /** Context tokens from $.session.usage, else null. */
       ctx: number | null
-      /** The Move session pane's data: move_session.py's accounts answer. */
+      /** The Sessions pane's data: move_session.py's accounts answer. */
       move: RollingContextMove | null
-      /** The Move session box above the prompt, where no pane is placed. */
+      /** The Sessions box above the prompt, where no pane is placed. */
       moveOpen: boolean
-      /** The account picked in the Move session pane. */
+      /** The account picked in the Sessions pane. */
       moveTo: string | null
-      /** What the Move session pane says while a move works, else null. */
+      /** What the Sessions pane says while a move works, else null. */
       moveBusy: string | null
-      /** The account the Move session pane imports from. */
+      /** The account picked in the Sessions pane's Switch account ('new': sign in to another). */
+      switchTo: string | null
+      /** What Switch account says while it starts a switch, else null. */
+      switchBusy: string | null
+      /** The account the Sessions pane imports from. */
       importFrom: string | null
       /** That account's sessions, move_session.py's sessions answer. */
       importList: RollingContextImportList | null
