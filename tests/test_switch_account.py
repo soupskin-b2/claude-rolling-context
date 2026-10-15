@@ -15,8 +15,10 @@
      its detached helper switches by itself.
   E. after a move: the helper waits for the move to finish, and gives up
      without quitting the app when it is cancelled.
-  F. the app is the topmost Claude ancestor; a Store install starts again
-     through its package.
+  F. on Windows the app is quit with WM_ENDSESSION, as at sign-out (a
+     stand-in window that quits on it, tests/endsession_window.py); the app
+     is the topmost Claude ancestor; a Store install starts again through
+     its package.
 
   python tests/test_switch_account.py
 """
@@ -243,6 +245,22 @@ check((m.read_json(s.state_path()) or {}).get("state") == "switched" and gone(ap
 
 
 print("F. the app's process")
+if sys.platform == "win32":
+    got = os.path.join(ROOT, "window.txt")
+    win = subprocess.Popen([sys.executable, os.path.join(HERE, "endsession_window.py"), got],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    until = time.time() + 10
+    while not os.path.exists(got) and time.time() < until:
+        time.sleep(0.1)
+    began = time.time()
+    check(s.quit_app(win.pid) and time.time() - began < 5,
+          "a window that quits on WM_ENDSESSION is quit that way, not ended outright")
+    with open(got) as f:
+        seen = f.read().split()
+    check(seen == ["ready", "query", "1", "end", "1", "1", "quit"],
+          "it is asked first, then told the session ends to close the app (ENDSESSION_CLOSEAPP)", str(seen))
+    with open(os.path.join(s.m.logins_dir(), "switch.log")) as f:
+        check("quit on session end" in f.read().splitlines()[-1], "the log says how it quit")
 check(s.claude_named(r"C:\Program Files\WindowsApps\Claude_2.1_x64__abc\app\claude.exe")
       and s.claude_named("/Applications/Claude.app/Contents/MacOS/Claude")
       and not s.claude_named("/usr/bin/bash"), "Claude executables are told apart from the rest")

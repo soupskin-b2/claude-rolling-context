@@ -15,9 +15,11 @@ cookie values and token caches are encrypted with a key of this OS user's
 copy taken while one account is signed in works again later on this
 computer and nowhere else.
 
-A switch quits the app, saves the login of the account it was signed in to
-under ~/.claude/rolling-context-logins/<account>/, puts the saved login of
-the account picked in its place and starts the app again. An account with no
+A switch quits the app (as Windows does at sign-out, with WM_ENDSESSION,
+which the app answers with its own clean quit; SIGTERM elsewhere), saves the
+login of the account it was signed in to under
+~/.claude/rolling-context-logins/<account>/, puts the saved login of the
+account picked in its place and starts the app again. An account with no
 saved login gets a signed-out app: sign in once and it is saved the next time
 the app switches away from it. Signing out in the app ends that login on the
 server, so the saved copy stops working too; switch here instead.
@@ -45,8 +47,9 @@ import time
 
 import move_session as m
 
-# How long a polite quit gets before the app is ended outright.
-QUIT_S = float(os.environ.get("ROLLING_CONTEXT_SWITCH_QUIT_S") or 10)
+# How long a clean quit gets before the app is ended outright: the app's own
+# quit cleanup gives up after 15 s and exits 2 s later.
+QUIT_S = float(os.environ.get("ROLLING_CONTEXT_SWITCH_QUIT_S") or 25)
 # How long a Move and switch waits for the move to finish.
 AFTER_MOVE_S = 600
 OAUTH = "oauth:"
@@ -264,31 +267,68 @@ def find_app():
     return found
 
 
+def end_session(pid):
+    """Tell the app's windows that the Windows session is ending, as Windows
+    does at sign-out: the app's main window answers WM_ENDSESSION with its
+    own quit (the one the tray's Exit runs), which skips the running-sessions
+    prompt and flushes its stores first. Closing the window only hides it to
+    the tray. True when there was a window to tell."""
+    u = ctypes.windll.user32
+    found = []
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def each(hwnd, _):
+        owner = wintypes.DWORD()
+        u.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            cls = ctypes.create_unicode_buffer(256)
+            u.GetClassNameW(hwnd, cls, 256)
+            if cls.value == "Chrome_WidgetWin_1":    # its windows, not Chromium's own
+                found.append(hwnd)
+        return True
+
+    u.EnumWindows(proc(each), 0)
+    u.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                      wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+    ENDSESSION_CLOSEAPP, SMTO_ABORTIFHUNG = 0x1, 0x2
+    WM_QUERYENDSESSION, WM_ENDSESSION = 0x11, 0x16
+    res = ctypes.c_size_t()
+    for msg, wparam in ((WM_QUERYENDSESSION, 0), (WM_ENDSESSION, 1)):
+        for hwnd in found:
+            u.SendMessageTimeoutW(hwnd, msg, wparam, ENDSESSION_CLOSEAPP, SMTO_ABORTIFHUNG, 5000, ctypes.byref(res))
+    return bool(found)
+
+
 def quit_app(pid):
-    """Ask the app to quit, then end it outright once QUIT_S is up; True when
-    it is gone."""
+    """Quit the app the way it quits itself, then end it outright once QUIT_S
+    is up; True when it is gone. Elsewhere SIGTERM is that quit."""
+    began = time.time()
     if sys.platform == "win32":
-        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, timeout=15)
+        how = "session end" if end_session(pid) else None
     else:
         try:
             os.kill(pid, 15)
+            how = "SIGTERM"
         except OSError:
-            pass
-    until = time.time() + QUIT_S
+            how = None
+    until = time.time() + (QUIT_S if how else 0)
     while m.pid_alive(pid) and time.time() < until:
         time.sleep(0.25)
-    if m.pid_alive(pid):
-        log(f"the app ({pid}) did not quit within {QUIT_S:g}s: ending it")
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15)
-        else:
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
-        until = time.time() + 10
-        while m.pid_alive(pid) and time.time() < until:
-            time.sleep(0.25)
+    if not m.pid_alive(pid):
+        log(f"the app ({pid}) quit on {how} in {time.time() - began:.1f}s")
+        return True
+    log(f"the app ({pid}) did not quit on {how} within {QUIT_S:g}s: ending it" if how
+        else f"the app ({pid}) has no window to tell: ending it")
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15)
+    else:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+    until = time.time() + 10
+    while m.pid_alive(pid) and time.time() < until:
+        time.sleep(0.25)
     return not m.pid_alive(pid)
 
 

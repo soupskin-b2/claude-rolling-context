@@ -325,10 +325,15 @@ computer.
   Logging out ends that login on the server, so the saved copy stops working
   too. Switch here instead.
 - Switching restarts the app, so sessions that are working stop. A switch
-  waits for this session's turn to end. The app is asked to quit and is ended
-  outright after 10 seconds. A detached helper
-  (`proxy/switch_account.py run`) does the swap, because this session's CLI
-  ends with the app. It logs to `~/.claude/rolling-context-logins/switch.log`.
+  waits for this session's turn to end. On Windows the app is quit the way
+  Windows quits it at sign-out: its window gets `WM_ENDSESSION`, which the app
+  answers with its own quit (the tray's **Exit**). That quit skips the
+  running-sessions prompt and saves its state first. Closing the window would
+  only hide it to the tray. On macOS and Linux it gets `SIGTERM`, which it
+  handles the same way. The app is ended outright only if it is still running
+  25 seconds later. A detached helper (`proxy/switch_account.py run`) does
+  the swap, because this session's CLI ends with the app. It logs how the app
+  quit to `~/.claude/rolling-context-logins/switch.log`.
 - A signed-out app saves nothing. A saved login is never replaced by one
   without a claude.ai session cookie.
 - **Forget saved login** deletes one.
