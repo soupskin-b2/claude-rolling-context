@@ -459,11 +459,24 @@ def pid_alive(pid):
             k.CloseHandle(h)
     try:
         os.kill(pid, 0)
-        return True
     except PermissionError:
-        return True
+        pass
     except OSError:
         return False
+    # An ended process its parent has not reaped yet answers kill(pid, 0):
+    # a zombie has ended.
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        pass
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+            return not out.stdout.strip().startswith("Z")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return True
 
 
 def remove_source(src, local_id):

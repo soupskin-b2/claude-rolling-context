@@ -16,9 +16,11 @@
   E. after a move: the helper waits for the move to finish, and gives up
      without quitting the app when it is cancelled.
   F. on Windows the app is quit with WM_ENDSESSION, as at sign-out (a
-     stand-in window that quits on it, tests/endsession_window.py); the app
-     is the topmost Claude ancestor; a Store install starts again through
-     its package.
+     stand-in window that quits on it, tests/endsession_window.py); elsewhere
+     what ran under the app is ended with it. The app is the parent of the
+     CLI it runs from its data folder. It starts again through its package
+     (Windows Store), its bundle (macOS), or as it was started (Linux: an
+     AppImage by its file, else its command line, read while it ran).
 
   python tests/test_switch_account.py
 """
@@ -35,7 +37,7 @@ ROOT = tempfile.mkdtemp(prefix="rolling-context-switch-")
 APP = os.path.join(ROOT, "app")
 LAUNCHED = os.path.join(ROOT, "launched")
 os.environ.update(HOME=ROOT, USERPROFILE=ROOT, ROLLING_CONTEXT_CLAUDE_APP_DIR=APP,
-                  ROLLING_CONTEXT_SWITCH_QUIT_S="1",
+                  ROLLING_CONTEXT_SWITCH_QUIT_S="1", ROLLING_CONTEXT_SWITCH_REAP_S="1",
                   ROLLING_CONTEXT_SWITCH_LAUNCH=json.dumps(
                       [sys.executable, "-c", f"open({LAUNCHED!r}, 'a').write('x')"]))
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -261,11 +263,36 @@ if sys.platform == "win32":
           "it is asked first, then told the session ends to close the app (ENDSESSION_CLOSEAPP)", str(seen))
     with open(os.path.join(s.m.logins_dir(), "switch.log")) as f:
         check("quit on session end" in f.read().splitlines()[-1], "the log says how it quit")
-check(s.claude_named(r"C:\Program Files\WindowsApps\Claude_2.1_x64__abc\app\claude.exe")
-      and s.claude_named("/Applications/Claude.app/Contents/MacOS/Claude")
-      and not s.claude_named("/usr/bin/bash"), "Claude executables are told apart from the rest")
+else:
+    # The app, with a helper under it that outlives it (as its network
+    # service may): the helper ignores SIGTERM and is ended after REAP_S.
+    kid = os.path.join(ROOT, "kid.txt")
+    app = subprocess.Popen([sys.executable, "-c",
+                            "import subprocess, sys, time\n"
+                            "k = subprocess.Popen([sys.executable, '-c', 'import signal, time; "
+                            "signal.signal(15, signal.SIG_IGN); time.sleep(120)'])\n"
+                            f"open({kid!r}, 'w').write(str(k.pid))\n"
+                            "time.sleep(120)"])
+    until = time.time() + 10
+    while not (os.path.exists(kid) and open(kid).read()) and time.time() < until:
+        time.sleep(0.1)
+    kpid = int(open(kid).read())
+    check(kpid in s.descendants(app.pid), "what runs under the app is found", str(s.descendants(app.pid)))
+    check(s.quit_app(app.pid) and gone(app), "the app quits on SIGTERM")
+    check(not m.pid_alive(kpid), "what it left running is ended too")
+    with open(os.path.join(s.m.logins_dir(), "switch.log")) as f:
+        tail = f.read().splitlines()[-2:]
+    check("quit on SIGTERM" in tail[0] and "left behind" in tail[1], "the log says so", str(tail))
+check(all(s.APP_CLI.search(x) for x in (
+          r"C:\Users\u\AppData\Roaming\Claude\claude-code\2.1.295\d2e2\claude.exe",
+          "/home/u/.config/Claude/claude-code/2.1.295/d2e2/claude",
+          "/Users/u/Library/Application Support/Claude/claude-code/2.1.295/d2e2/claude"))
+      and not any(s.APP_CLI.search(x) for x in (
+          r"C:\Users\u\.local\bin\claude.exe", "/home/u/.local/bin/claude",
+          "/home/u/.local/share/claude/versions/2.1.295")),
+      "the app's CLI is told apart from one started in a terminal")
 me = s.find_app()
-check(me == (None, None) or s.claude_named(me[1]), "find_app answers a Claude process or nothing", str(me))
+check(me == (None, None) or me[0] != os.getpid(), "find_app answers the app or nothing", str(me))
 os.environ.pop("ROLLING_CONTEXT_SWITCH_LAUNCH")
 if sys.platform == "win32":
     pkg = os.path.join(ROOT, "WindowsApps", "Claude_2.37337.1.0_x64__pzs8sxrjxfjjc")
@@ -281,6 +308,32 @@ if sys.platform == "win32":
 elif sys.platform == "darwin":
     check(s.launch_argv("/Applications/Claude.app/Contents/MacOS/Claude") == ["open", "/Applications/Claude.app"],
           "a macOS app starts through its bundle")
+else:
+    sleep = [sys.executable, "-c", "import time; time.sleep(30)", "--class=Claude"]
+    for env, want, label in (
+            ({"APPIMAGE": "/home/u/Apps/Claude.AppImage"}, ["/home/u/Apps/Claude.AppImage"],
+             "an AppImage starts again by its file, not from its mount"),
+            ({}, sleep, "anything else as it was started, arguments too")):
+        p = subprocess.Popen(sleep, env={**os.environ, **env})
+        time.sleep(0.3)
+        argv = s.launch_argv("/tmp/.mount_Claude/claude", p.pid)
+        p.kill()
+        p.wait()
+        check(argv == want, label, str(argv))
+    os.environ["CLAUDECODE"] = "1"
+    p = subprocess.Popen(sleep, env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"} | {"ONLY_APP": "y"})
+    time.sleep(0.3)
+    env = s.launch_env(p.pid)
+    p.kill()
+    p.wait()
+    os.environ.pop("CLAUDECODE")
+    check(env and env.get("ONLY_APP") == "y" and "CLAUDECODE" not in env,
+          "it starts again in its own environment, not this session's")
+    os.environ["SNAP"] = "/snap/claude/1"
+    out = s.switch("new", app_pid=os.getpid())
+    os.environ.pop("SNAP")
+    check(out["ok"] is False and "sandbox" in out["error"], "a switch is refused inside a Snap or Flatpak", str(out))
+    check(s.launch_argv("/opt/Claude/claude") == ["/opt/Claude/claude"], "with the app gone, by its exe")
 
 print()
 if failures:

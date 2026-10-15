@@ -315,8 +315,8 @@ switch saves the outgoing account's login in
 `~/.claude/rolling-context-logins/<account>/`, puts the chosen account's saved
 login in its place, and starts the app again. The cookie values and token
 caches are encrypted with a key of this OS user (DPAPI on Windows, the
-keychain on macOS), so a saved login works only for this user on this
-computer.
+keychain on macOS, the keyring on Linux), so a saved login works only for
+this user on this computer.
 
 - An account with no saved login says **sign in once**. Switching to it (or
   to **Another account (sign in)**) starts the app signed out. Sign in as
@@ -331,7 +331,9 @@ computer.
   running-sessions prompt and saves its state first. Closing the window would
   only hide it to the tray. On macOS and Linux it gets `SIGTERM`, which it
   handles the same way. The app is ended outright only if it is still running
-  25 seconds later. A detached helper (`proxy/switch_account.py run`) does
+  25 seconds later. On macOS and Linux, any of its own processes still
+  running 10 seconds after it quits are ended too, since its network service
+  writes the cookie database. A detached helper (`proxy/switch_account.py run`) does
   the swap, because this session's CLI ends with the app. It logs how the app
   quit to `~/.claude/rolling-context-logins/switch.log`.
 - A signed-out app saves nothing. A saved login is never replaced by one
@@ -341,9 +343,19 @@ computer.
   switches the app to the account it went to once the move has finished. The
   moved session is waiting in the sidebar there. It needs a saved login for
   that account.
+- The helper finds the app as the parent of the Claude Code CLI it runs from
+  its data folder. A `claude` started in a terminal is never taken for the
+  app, so nothing gets quit there.
 - On Windows the app relaunches through its Store package
-  (`shell:AppsFolder\Claude_…!Claude`) or its exe, on macOS through its
-  `.app`. Only Windows has been tried with the real app.
+  (`shell:AppsFolder\Claude_…!Claude`) or its exe, and on macOS through its
+  `.app`. On Linux it relaunches the way it was started, read while it was
+  running: an AppImage by its `.AppImage` file, anything else by its command
+  line, in the app's own environment rather than this session's.
+- Inside a Flatpak or Snap, switching is refused: the sandbox would end the
+  helper along with the app, leaving the app closed. Sign in from the app
+  there.
+- Only Windows has been tried with the real app. The Linux paths are tested
+  under WSL with stand-in processes.
 
 ## Moving a session to another account
 

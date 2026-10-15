@@ -29,7 +29,8 @@ that outlives them: `switch` checks, starts `run` and returns at once.
 
   python switch_account.py switch --to ACCOUNT|new [--after-move CLI_ID] [--app-pid PID]
   python switch_account.py forget --account ACCOUNT
-  python switch_account.py run    --to ACCOUNT|new --app-pid PID [--after-move CLI_ID]  (internal)
+  python switch_account.py run    --to ACCOUNT|new --app-pid PID [--exe EXE] [--after-move CLI_ID]
+                                                                         (internal)
 
 Every command prints one JSON object. ROLLING_CONTEXT_CLAUDE_APP_DIR overrides
 the app's data folder, ROLLING_CONTEXT_SWITCH_LAUNCH (a JSON argv) how the app
@@ -50,6 +51,8 @@ import move_session as m
 # How long a clean quit gets before the app is ended outright: the app's own
 # quit cleanup gives up after 15 s and exits 2 s later.
 QUIT_S = float(os.environ.get("ROLLING_CONTEXT_SWITCH_QUIT_S") or 25)
+# How long what ran under the app gets to end with it before it is ended.
+REAP_S = float(os.environ.get("ROLLING_CONTEXT_SWITCH_REAP_S") or 10)
 # How long a Move and switch waits for the move to finish.
 AFTER_MOVE_S = 600
 OAUTH = "oauth:"
@@ -244,27 +247,26 @@ def exe_of(pid):
         return None
 
 
-def claude_named(exe):
-    name = os.path.basename(exe or "").lower()
-    return name in ("claude", "claude.exe", "claude-desktop")
+# The Claude Code CLI the app runs, from its data folder (the Store install's
+# virtualized copy of it too): <...>/Claude/claude-code/<version>/<hash>/claude.
+APP_CLI = re.compile(r"[\\/]Claude[\\/]claude-code[\\/]", re.IGNORECASE)
 
 
 def find_app():
-    """(pid, exe) of the app this session runs in. The CLI (claude.exe) is
-    the app's child, and Windows names both claude.exe, so the app is the
-    topmost Claude ancestor of this script (shells may sit between)."""
-    found = (None, None)
+    """(pid, exe) of the app this session runs in: the parent of the Claude
+    Code CLI the app started from its data folder (shells may sit between it
+    and this script). A CLI started from a terminal is not the app's, and is
+    never taken for it: nothing is quit then."""
     pid = os.getpid()
     for _ in range(12):
-        pid = parent_of(pid)
-        if not pid:
+        parent = parent_of(pid)
+        if not parent:
             break
-        exe = exe_of(pid)
-        if claude_named(exe):
-            found = (pid, exe)
-        elif found[0]:
-            break
-    return found
+        if APP_CLI.search(exe_of(pid) or ""):
+            exe = exe_of(parent)
+            return (parent, exe) if exe else (None, None)
+        pid = parent
+    return None, None
 
 
 def end_session(pid):
@@ -299,10 +301,34 @@ def end_session(pid):
     return bool(found)
 
 
+def descendants(pid):
+    """Every process under pid (POSIX): the app's helpers (GPU, network
+    service, renderers) may outlive it for a moment once it is ended."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids = {}
+    for line in out.splitlines():
+        try:
+            c, p = (int(x) for x in line.split())
+        except ValueError:
+            continue
+        kids.setdefault(p, []).append(c)
+    found, todo = [], [pid]
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            if c not in found:
+                found.append(c)
+                todo.append(c)
+    return found
+
+
 def quit_app(pid):
     """Quit the app the way it quits itself, then end it outright once QUIT_S
     is up; True when it is gone. Elsewhere SIGTERM is that quit."""
     began = time.time()
+    family = [] if sys.platform == "win32" else descendants(pid)
     if sys.platform == "win32":
         how = "session end" if end_session(pid) else None
     else:
@@ -316,20 +342,43 @@ def quit_app(pid):
         time.sleep(0.25)
     if not m.pid_alive(pid):
         log(f"the app ({pid}) quit on {how} in {time.time() - began:.1f}s")
-        return True
+        return reap(family)
     log(f"the app ({pid}) did not quit on {how} within {QUIT_S:g}s: ending it" if how
         else f"the app ({pid}) has no window to tell: ending it")
     if sys.platform == "win32":
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15)
     else:
-        try:
-            os.kill(pid, 9)
-        except OSError:
-            pass
+        for p in [pid] + family:
+            try:
+                os.kill(p, 9)
+            except OSError:
+                pass
     until = time.time() + 10
     while m.pid_alive(pid) and time.time() < until:
         time.sleep(0.25)
-    return not m.pid_alive(pid)
+    return not m.pid_alive(pid) and reap(family)
+
+
+def reap(family, seconds=None):
+    """Wait for what was under the app to end too (POSIX, where nothing like
+    taskkill /T ends it with the app), ending what still runs: its network
+    service writes the cookie database. A process a session started detached
+    (as this helper is) is no longer under the app and is left alone."""
+    until = time.time() + (REAP_S if seconds is None else seconds)
+    while any(m.pid_alive(p) for p in family) and time.time() < until:
+        time.sleep(0.25)
+    left = [p for p in family if m.pid_alive(p)]
+    for p in left:
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
+    until = time.time() + 5
+    while any(m.pid_alive(p) for p in left) and time.time() < until:
+        time.sleep(0.1)
+    if left:
+        log(f"ended {len(left)} process(es) the app left behind")
+    return True
 
 
 def wait_unlocked(seconds=15):
@@ -346,8 +395,28 @@ def wait_unlocked(seconds=15):
     return False
 
 
-def launch_argv(exe):
-    """How to start the app again, from its executable."""
+def proc_environ(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            items = f.read().split(b"\0")
+    except OSError:
+        return {}
+    return dict(i.decode("utf-8", "replace").split("=", 1) for i in items if b"=" in i)
+
+
+def proc_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def launch_argv(exe, pid=None):
+    """How to start the app again: from its executable, and on Linux from
+    how it was started, read while it runs (an AppImage's exe is inside a
+    mount that goes away with it, and an app run by a system Electron is that
+    electron plus its app)."""
     env = os.environ.get("ROLLING_CONTEXT_SWITCH_LAUNCH")
     if env:
         return json.loads(env)
@@ -366,12 +435,31 @@ def launch_argv(exe):
     if sys.platform == "darwin":
         bundle = re.match(r"(.*?\.app)/Contents/MacOS/", exe or "")
         return ["open", bundle.group(1)] if bundle else ["open", "-a", "Claude"]
-    return [exe] if exe else None
+    if pid and proc_environ(pid).get("APPIMAGE"):
+        return [proc_environ(pid)["APPIMAGE"]]
+    return proc_cmdline(pid) or ([exe] if exe else None)
 
 
-def launch(exe):
-    argv = launch_argv(exe)
-    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+def launch_env(pid):
+    """The environment to start the app again in. Windows and macOS start it
+    through the shell (explorer, open), which gives it its own; on Linux the
+    helper starts it, so it gets the one it ran in, read while it runs, not
+    this session's (CLAUDECODE, the proxy's HTTPS_PROXY)."""
+    if sys.platform in ("win32", "darwin") or not pid:
+        return None
+    return proc_environ(pid) or None
+
+
+def sandboxed():
+    """In a Flatpak or Snap everything inside goes when the app does, the
+    helper too: it would quit the app and never start it again."""
+    return os.path.exists("/.flatpak-info") or bool(os.environ.get("SNAP"))
+
+
+def launch(exe, argv=None, env=None):
+    argv = argv or launch_argv(exe)
+    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+              env=env)
     try:
         if not argv:
             raise OSError("no way to start it")
@@ -412,7 +500,9 @@ def wait_for_move(cli_id):
 
 
 def run(to, app_pid, exe, after_move=None):
-    st = {"state": "quitting", "at": time.time(), "to": to, "appPid": app_pid, "exe": exe}
+    # How the app was started, and in what, read now while it still runs.
+    argv, env = launch_argv(exe, app_pid), launch_env(app_pid)
+    st = {"state": "quitting", "at": time.time(), "to": to, "appPid": app_pid, "exe": exe, "launch": argv}
     if after_move:
         st["state"] = "waiting-for-move"
         write_state(st)
@@ -436,7 +526,7 @@ def run(to, app_pid, exe, after_move=None):
     except (OSError, sqlite3.Error) as e:
         st.update(state="failed", reason=str(e))
         log(f"switch to {short(to)} failed: {e}")
-    st["launched"] = launch(exe)
+    st["launched"] = launch(exe, argv, env)
     st["endedAt"] = time.time()
     write_state(st)
     log(f"switched {short(st.get('from'))} -> {short(to)}, app started again: {st['launched']}")
@@ -467,6 +557,9 @@ def switch(to, after_move=None, app_pid=None):
         if not m.has_login(to):
             return {"ok": False, "error": "No saved login for that account: sign in to it once (Sign in to "
                                           "another account), and it is saved when the app switches away."}
+    if sandboxed():
+        return {"ok": False, "error": "The Claude app runs in a Flatpak or Snap sandbox here, which would end "
+                                      "the switch along with the app: sign in from the app instead."}
     exe = exe_of(app_pid) if app_pid else None
     # With another data folder (tests), the app this runs in is not the one
     # whose login would change: never quit it.
