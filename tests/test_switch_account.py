@@ -285,11 +285,13 @@ else:
     check("quit on SIGTERM" in tail[0] and "left behind" in tail[1], "the log says so", str(tail))
 check(all(s.APP_CLI.search(x) for x in (
           r"C:\Users\u\AppData\Roaming\Claude\claude-code\2.1.295\d2e2\claude.exe",
+          r"C:\Users\u\AppData\Local\Claude-Data\claude_pzs8sxrjxfjjc\claude-code\2.1.299\f058\claude.exe",
           "/home/u/.config/Claude/claude-code/2.1.295/d2e2/claude",
           "/Users/u/Library/Application Support/Claude/claude-code/2.1.295/d2e2/claude"))
       and not any(s.APP_CLI.search(x) for x in (
           r"C:\Users\u\.local\bin\claude.exe", "/home/u/.local/bin/claude",
-          "/home/u/.local/share/claude/versions/2.1.295")),
+          "/home/u/.local/share/claude/versions/2.1.295",
+          "/home/u/.config/Claude/claude-code/2.1.295/d2e2/claude-helper")),
       "the app's CLI is told apart from one started in a terminal")
 me = s.find_app()
 check(me == (None, None) or me[0] != os.getpid(), "find_app answers the app or nothing", str(me))

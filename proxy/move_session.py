@@ -51,6 +51,7 @@ the app's data folder (tests).
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -81,10 +82,31 @@ def app_dir():
     if env:
         return env
     if sys.platform == "win32":
-        return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming"), "Claude")
+        roaming = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~/AppData/Roaming"), "Claude")
+        return moved_app_dir(roaming) or roaming
     if sys.platform == "darwin":
         return os.path.expanduser("~/Library/Application Support/Claude")
     return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "Claude")
+
+
+def moved_app_dir(roaming):
+    """Where a Store install of the app keeps its data once it has moved it
+    out of the package (app 2.42 on): it leaves .user-data-left.<package
+    family> in its old folder and keeps everything in
+    %LOCALAPPDATA%/Claude-Data/<package family>. A .user-data-back marker
+    means it moved back."""
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~/AppData/Local")
+    try:
+        names = os.listdir(roaming)
+    except OSError:
+        return None
+    for name in names:
+        left = re.match(r"^\.user-data-left\.([a-z0-9.-]+_[a-z0-9]+)$", name)
+        if left:
+            moved = os.path.join(local, "Claude-Data", left.group(1))
+            if os.path.isdir(moved):
+                return moved
+    return None
 
 
 def sessions_root():

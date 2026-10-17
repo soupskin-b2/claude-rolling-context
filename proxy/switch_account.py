@@ -247,9 +247,10 @@ def exe_of(pid):
         return None
 
 
-# The Claude Code CLI the app runs, from its data folder (the Store install's
-# virtualized copy of it too): <...>/Claude/claude-code/<version>/<hash>/claude.
-APP_CLI = re.compile(r"[\\/]Claude[\\/]claude-code[\\/]", re.IGNORECASE)
+# The Claude Code CLI the app runs from its data folder, wherever that is
+# (Roaming\Claude, the Store install's Claude-Data\<package family>,
+# ~/.config/Claude): <data>/claude-code/<version>/<hash>/claude.
+APP_CLI = re.compile(r"[\\/]claude-code[\\/][^\\/]+[\\/][^\\/]+[\\/]claude(?:\.exe)?$", re.IGNORECASE)
 
 
 def find_app():

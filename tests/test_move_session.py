@@ -17,6 +17,8 @@
      imported (no transcript on this computer); import moves one into this
      session's account at once, backed up and removed from the other the way
      the app's delete does.
+  G. a Store install that moved its data out of the package (app 2.42 on)
+     is followed to Claude-Data/<package family> by the marker it leaves.
 
   python tests/test_move_session.py
 """
@@ -345,6 +347,32 @@ def test_import():
           "the sessions command answers in one JSON object", r.stdout + r.stderr)
 
 
+def test_data_dir():
+    print("G. the app's data folder")
+    roaming = os.path.join(ROOT, "Roaming", "Claude")
+    local = os.path.join(ROOT, "Local")
+    os.makedirs(roaming)
+    saved = {k: os.environ.get(k) for k in ("LOCALAPPDATA",)}
+    os.environ["LOCALAPPDATA"] = local
+    try:
+        check(m.moved_app_dir(roaming) is None, "the app's own folder while it has not moved")
+        open(os.path.join(roaming, ".user-data-left.claude_pzs8sxrjxfjjc"), "w").close()
+        check(m.moved_app_dir(roaming) is None, "not a moved folder that is not there")
+        moved = os.path.join(local, "Claude-Data", "claude_pzs8sxrjxfjjc")
+        os.makedirs(moved)
+        check(m.moved_app_dir(roaming) == moved,
+              "a Store install's data, moved out of the package, in Claude-Data/<package family>")
+        os.remove(os.path.join(roaming, ".user-data-left.claude_pzs8sxrjxfjjc"))
+        open(os.path.join(roaming, ".user-data-back.claude_pzs8sxrjxfjjc"), "w").close()
+        check(m.moved_app_dir(roaming) is None, "back in its own folder once it moved back")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     try:
         test_accounts()
@@ -353,6 +381,7 @@ if __name__ == "__main__":
         test_cancel()
         test_import()
         test_spawned()
+        test_data_dir()
     finally:
         time.sleep(0.5)
         shutil.rmtree(ROOT, ignore_errors=True)

@@ -163,6 +163,21 @@ describe('Sessions', () => {
     expect(await b.find({ key: 'move' })).toBeUndefined()
   })
 
+  test('appears once the app writes a record it did not have when the session started', async ($, on) => {
+    const w = world(on, accounts({ session: null, accounts: [], blocked: 'no record' }))
+    await start($, on)
+    await w.clock.settle()
+    const b = await band($)
+    expect(await b.find({ key: 'move' })).toBeUndefined()
+    w.state.info = accounts()
+    await w.clock.advance(30_000)
+    await b.redraw()
+    expect((await b.find({ key: 'move' }))?.text).toBe('Sessions')
+    const lookups = w.runs.filter(r => r[0] === 'accounts').length
+    await w.clock.advance(90_000)
+    expect(w.runs.filter(r => r[0] === 'accounts').length).toBe(lookups) // found: not looked for again
+  })
+
   test('opens a pane offering the other accounts, then moves and asks the app to archive it here', async ($, on) => {
     const w = world(on)
     await start($, on)

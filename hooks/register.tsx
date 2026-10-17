@@ -193,6 +193,10 @@ const clean = (text: string) =>
 let showStatus = true
 let showControls = true
 let showMove = true
+// Lookups left for a session the app has no record of yet: the app may write
+// a new session's record after the session starts, so it is looked for again
+// on each status refresh for the first ten minutes.
+let moveTries = 20
 // Whether a model turn runs: a session moves only while stopped.
 let working = false
 // Whether a surface draws the row under the prompt; then the band stays
@@ -510,6 +514,12 @@ async function loadMove($: EngineInterface) {
       ? cur
       : (info.accounts.find(a => a.account !== here)?.account ?? null))
   return info
+}
+
+async function retryMove($: EngineInterface) {
+  if ((await read($, moveNow))?.session || moveTries <= 0) return
+  moveTries--
+  await loadMove($)
 }
 
 const accountLabel = (a: Account | undefined, id = '') =>
@@ -1109,7 +1119,10 @@ export const register: Register = (on, options) => {
     void optionRows($).catch(() => {}) // records which pluginConfigs entry is live
     // Whether the app has a record of this session, for the Move button.
     if (showMove) void loadMove($).catch(() => {})
-    $.clock.every(STATUS_EVERY_MS, () => void refreshStatus($))
+    $.clock.every(STATUS_EVERY_MS, () => {
+      void refreshStatus($)
+      if (showMove) void retryMove($).catch(() => {})
+    })
     if (!showStatus) $.ui.status(undefined)
     // /roll is the plugin's only command. A name another command already
     // holds (a built-in or its alias, as /rc is /remote-control's) is refused

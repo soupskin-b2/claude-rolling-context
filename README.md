@@ -368,7 +368,14 @@ it there. If it is missing from the list, restart the app.
 
 The app files each session under its account, in
 `claude-code-sessions/<account>/<org>/local_<id>.json` in its data folder,
-and that record is the only thing tied to the account. The transcript
+and that record is the only thing tied to the account. The data folder is
+`%APPDATA%\Claude` on Windows, or `%LOCALAPPDATA%\Claude-Data\<package>`
+once a Store install has moved its data out of the package (app 2.42 and
+later), followed by the `.user-data-left.<package>` marker the app leaves
+behind. It is `~/Library/Application Support/Claude` on macOS and
+`~/.config/Claude` on Linux. **Sessions** shows only in a session the app
+has a record of. A new session's record can appear after the session starts,
+so it is looked for again every 30 seconds for the first ten minutes. The transcript
 (`~/.claude/projects/…`), the scratchpad, this plugin's per-session switch
 and its stored compressions are machine-wide and keyed by the CLI session id
 or by content, so the move keeps that id and leaves them where they are. The
